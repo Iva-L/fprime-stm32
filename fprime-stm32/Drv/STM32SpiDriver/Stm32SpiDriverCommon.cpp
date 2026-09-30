@@ -12,8 +12,6 @@
 #include <fprime-stm32/Drv/STM32SpiDriver/Stm32SpiDriver.hpp>
 #include <Fw/Types/Assert.hpp>
 
-#if SPI_ENABLED
-
 namespace Stm32 {
 
 // ----------------------------------------------------------------------
@@ -64,5 +62,3 @@ void Stm32SpiDriver ::SpiReadWrite_handler(FwIndexType portNum, Fw::Buffer& writ
 }
 
 }  // namespace Stm32
-
-#endif  // SPI_ENABLED
