@@ -10,8 +10,6 @@
 
 #include <fprime-stm32/Drv/STM32SpiDriver/Stm32SpiDriver.hpp>
 
-#if SPI_ENABLED
-
 // Injectable stub state for unit tests
 extern bool Stub_hwOpenSucceeds = true;               // simulates MX_SPIn_Init()
 extern I32 Stub_hwTransmitReceiveStatus = 0;           // HAL_StatusTypeDef hwTransmitReceive() reports (0 == HAL_OK)
@@ -80,5 +78,3 @@ I32 Stm32SpiDriver ::hwTransmitReceive(const U8* txData, U8* rxData, FwSizeType 
 }
 
 }  // namespace Stm32
-
-#endif  // SPI_ENABLED

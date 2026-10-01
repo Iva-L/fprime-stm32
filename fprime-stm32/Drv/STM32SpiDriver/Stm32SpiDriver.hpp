@@ -14,8 +14,6 @@
 #include <Fw/Types/Assert.hpp>
 #include <config/Stm32Config.hpp>
 
-#if SPI_ENABLED
-
 namespace Stm32 {
 
 //! SPI peripheral identifier, covering every instance present on an STM32H753.
@@ -84,5 +82,4 @@ class Stm32SpiDriver final : public Stm32SpiDriverComponentBase {
 
 }  // namespace Stm32
 
-#endif  // SPI_ENABLED
 #endif  // Stm32_Stm32SpiDriver_HPP
