@@ -3,5 +3,6 @@ register_fprime_config(
     HEADERS
         "${CMAKE_CURRENT_LIST_DIR}/Stm32Config.hpp"
         "${CMAKE_CURRENT_LIST_DIR}/UartDriverConfig.hpp"
+        "${CMAKE_CURRENT_LIST_DIR}/Stm32TransferMode.hpp"
     INTERFACE
 )

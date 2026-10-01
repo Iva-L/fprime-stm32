@@ -16,7 +16,28 @@
 // keeps this Cortex-M7-generic helper portable across STM32 families.
 #include "main.h"
 
+#include <Fw/Types/Assert.hpp>
+
 namespace Stm32 {
+
+//! DTCM RAM base/size on an STM32H753 (see the project linker script,
+//! e.g. STM32H753xx_FLASH.ld). The DTCM bus is not reachable by any DMA
+//! controller on this chip, unlike the default AXI SRAM region -- a buffer
+//! handed to a `_DMA` HAL call must never live here.
+constexpr std::uintptr_t DTCM_RAM_BASE = 0x20000000U;
+constexpr std::uintptr_t DTCM_RAM_SIZE = 0x20000U;  // 128 KiB
+
+//! Assert that [addr, addr + size) does not overlap DTCM RAM, i.e. it is
+//! safe to hand to a DMA-backed HAL call. This is a programmer invariant
+//! (the caller's buffer placement, not externally supplied data), so a
+//! violation is a build/configuration bug, not a runtime input to guard
+//! against gracefully.
+inline void AssertDmaSafe(const void* addr, std::size_t size) {
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    const auto end = start + size;
+    const bool overlapsDtcm = (start < DTCM_RAM_BASE + DTCM_RAM_SIZE) && (end > DTCM_RAM_BASE);
+    FW_ASSERT(!overlapsDtcm, static_cast<FwAssertArgType>(start));
+}
 
 //! Clean D-cache over [addr, addr + size) before starting a memory-to-peripheral
 //! DMA transfer, so the DMA controller reads data the CPU has actually written.
