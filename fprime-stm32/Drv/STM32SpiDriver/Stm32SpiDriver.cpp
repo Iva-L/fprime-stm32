@@ -11,8 +11,6 @@
 #include <fprime-stm32/Drv/STM32SpiDriver/Stm32SpiDriver.hpp>
 #include <Fw/Types/Assert.hpp>
 
-#if SPI_ENABLED
-
 #include "spi.h"
 
 namespace {
@@ -238,5 +236,3 @@ I32 Stm32SpiDriver ::hwTransmitReceive(const U8* txData, U8* rxData, FwSizeType 
 }
 
 }  // namespace Stm32
-
-#endif  // SPI_ENABLED
