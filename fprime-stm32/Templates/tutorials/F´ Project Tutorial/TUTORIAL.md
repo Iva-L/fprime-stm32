@@ -866,7 +866,7 @@ If you are using VSCode, you can integrate the flashing process into your develo
             "type": "cortex-debug",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build-artifacts/stm32h7 Stm32h7Project_Deployments_Stm32h7Deployment/bin Stm32h7Project_Deployments_Stm32h7Deployment",
+            "executable": "${workspaceFolder}/build-artifacts/stm32h7/Stm32h7Project_Deployments_Stm32h7Deployment/bin Stm32h7Project_Deployments_Stm32h7Deployment",
             "servertype": "stlink", 
             "device": "STM32H753XI",
             "interface": "swd",
@@ -886,6 +886,13 @@ which arm-none-eabi-gdb
 which ST-LINK_gdbserver
 which STM32CubeProgrammer
 ```
+
+>[!TIP] 
+>Remember that you can test your program using the native fprime-gds with:
+> ```shell
+> #In stm32h7-project
+> fprime-gds --dictionary build-artifacts/stm32h7/Stm32h7Project_Deployments_Stm32h7Deployment/dict/Stm32h7Project_Deployments_Stm32h7DeploymentTopologyDictionary.json --communication-selection uart --uart-device /dev/ttyACM0 --uart-baud 115200 --no-app
+> ```
 
 ## 11. Conclusion
 
