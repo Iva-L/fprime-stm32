@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nasa/fprime
-          ref: devel  # pin to a tag/commit this library is actually verified against
+          ref: 8a42c8b5309acf1a61bb71d6fac62872f26e9990
           path: fprime
 
       - name: Write throwaway CI project
