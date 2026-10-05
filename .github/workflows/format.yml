@@ -8,18 +8,54 @@ on:
 
 jobs:
   format-check:
+    name: Run F' Format Check
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout F' framework
+        uses: actions/checkout@v4
+        with:
+          repository: nasa/fprime
+          ref: 8a42c8b5309acf1a61bb71d6fac62872f26e9990
+          path: fprime
+          submodules: recursive
+
+      - name: Write throwaway CI project
+        run: |
+          cat > settings.ini << 'EOF'
+          [fprime]
+          project_root: .
+          framework_path: ./fprime
+          EOF
+          cat > CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.24.2)
+          project(FprimeStm32CI C CXX)
+          include("${CMAKE_CURRENT_LIST_DIR}/fprime/cmake/FPrime.cmake")
+          fprime_setup_included_code()
+          include("${CMAKE_CURRENT_LIST_DIR}/library.cmake")
+          EOF
+          mkdir -p FprimeStm32BaremetalReference/config/fprime-stm32
+          cat > FprimeStm32BaremetalReference/config/fprime-stm32/Stm32Config.hpp << 'EOF'
+          #ifndef STM32_CONFIG_HPP
+          #define STM32_CONFIG_HPP
+          #define USART_ENABLED (true)
+          #define TIM_ENABLED (true)
+          #define I2C_ENABLED (true)
+          #define SPI_ENABLED (true)
+          #endif
+          EOF
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install F' Formatting Tools
+      - name: Install F' Tools
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
