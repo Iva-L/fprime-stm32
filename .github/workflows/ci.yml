@@ -30,7 +30,7 @@ jobs:
       - name: Install F' Tools
         run: |
           python -m pip install --upgrade pip
-          pip install -r lib/fprime/requirements.txt
+          pip install -r requirements.txt
 
       - name: Verify Environment
         run: |
