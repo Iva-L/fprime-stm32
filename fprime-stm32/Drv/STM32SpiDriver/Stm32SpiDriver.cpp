@@ -10,7 +10,10 @@
 
 #include <fprime-stm32/Drv/STM32SpiDriver/Stm32SpiDriver.hpp>
 #include <Fw/Types/Assert.hpp>
+#include <Os/RawTime.hpp>
 
+#include "CacheMaintenance.hpp"
+#include "dma.h"
 #include "spi.h"
 
 namespace {
@@ -174,11 +177,71 @@ void enableGpioClock(GPIO_TypeDef* port) {
 
 }  // namespace
 
+namespace {
+
+//! Callback registry: HAL_SPI_TxRxCpltCallback()/HAL_SPI_ErrorCallback() are
+//! free functions with no user-context pointer, only a raw
+//! SPI_HandleTypeDef*, so mapping back to "which Stm32SpiDriver instance
+//! owns this handle" needs a table rather than a single cached pointer --
+//! same reasoning and shape as Stm32UartDriver.cpp's s_uartRegistry. Only
+//! instances opened in DMA mode are registered; a POLLED instance never
+//! triggers these callbacks.
+constexpr FwSizeType SPI_INSTANCE_CAPACITY = 6;  // SpiInstance::Spi1..Spi6
+
+struct SpiRegistryEntry {
+    SPI_HandleTypeDef* handle = nullptr;
+    Stm32::Stm32SpiDriver* component = nullptr;
+};
+
+SpiRegistryEntry s_spiRegistry[SPI_INSTANCE_CAPACITY];
+
+//! Look up which live Stm32SpiDriver instance (if any) owns `hspi`, by
+//! linear scan of the small (<=6-entry) registry.
+Stm32::Stm32SpiDriver* findSpiComponent(SPI_HandleTypeDef* hspi) {
+    for (FwSizeType i = 0; i < SPI_INSTANCE_CAPACITY; i++) {
+        if (s_spiRegistry[i].handle == hspi && s_spiRegistry[i].component != nullptr) {
+            return s_spiRegistry[i].component;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+extern "C" void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef* hspi) {
+    FW_ASSERT(hspi != nullptr);
+    Stm32::Stm32SpiDriver* const component = findSpiComponent(hspi);
+    if (component != nullptr) {
+        component->signalDmaComplete();
+    }
+}
+
+extern "C" void HAL_SPI_ErrorCallback(SPI_HandleTypeDef* hspi) {
+    FW_ASSERT(hspi != nullptr);
+    Stm32::Stm32SpiDriver* const component = findSpiComponent(hspi);
+    if (component != nullptr) {
+        component->signalDmaError(hspi->ErrorCode);
+    }
+}
+
 namespace Stm32 {
 
-Fw::Success Stm32SpiDriver ::open(SpiInstance instance, Stm32::GpioPort csPort, U16 csPin, U32 timeoutMs) {
+Fw::Success Stm32SpiDriver ::open(SpiInstance instance,
+                                   Stm32::GpioPort csPort,
+                                   U16 csPin,
+                                   U32 timeoutMs,
+                                   TransferMode mode) {
     SPI_HandleTypeDef* const halHandle = toHalHandle(instance);
     FW_ASSERT(halHandle != nullptr, static_cast<FwAssertArgType>(instance));
+
+    // DMA1 clock/NVIC must be enabled before HAL_SPI_MspInit() links a DMA
+    // stream to this instance (mirrors Stm32UartDriver.cpp's hwOpen()).
+    // Idempotent to call even when this instance stays POLLED-only, and
+    // harmless if another already-open driver (e.g. the USART1 comms link)
+    // already ran it.
+    if (mode == TransferMode::DMA) {
+        MX_DMA_Init();
+    }
 
     // MX_SPIn_Init() traps in Error_Handler() on failure rather than
     // returning a status (matches every other CubeMX-generated
@@ -205,7 +268,27 @@ Fw::Success Stm32SpiDriver ::open(SpiInstance instance, Stm32::GpioPort csPort, 
     this->m_csPort = csPort;
     this->m_csPin = csPin;
     this->m_timeoutMs = timeoutMs;
+    this->m_transferMode = mode;
     this->m_opened = true;
+
+    if (mode == TransferMode::DMA) {
+        // This project's current CubeMX configuration for SPI5 has no DMA
+        // request attached (see lib/fprime-stm32/src/spi.c's
+        // HAL_SPI_MspInit() -- no __HAL_LINKDMA() call), so hdmatx/hdmarx
+        // are null and HAL_SPI_TransmitReceive_DMA() would dereference a
+        // null DMA handle. Assert loudly here instead of crashing
+        // mid-transfer: regenerate the CubeMX project with a DMA request
+        // added to this SPI instance before opening it in DMA mode.
+        FW_ASSERT(halHandle->hdmatx != nullptr, static_cast<FwAssertArgType>(instance));
+        FW_ASSERT(halHandle->hdmarx != nullptr, static_cast<FwAssertArgType>(instance));
+
+        // Registered by instance index (bounds-safe: the enum itself can't
+        // index outside the table), not a single shared pointer -- lets a
+        // second, simultaneously-open DMA instance route its completion/
+        // error callbacks correctly without disturbing this one's.
+        FW_ASSERT(static_cast<FwSizeType>(instance) < SPI_INSTANCE_CAPACITY, static_cast<FwAssertArgType>(instance));
+        s_spiRegistry[static_cast<FwSizeType>(instance)] = {halHandle, this};
+    }
 
     Fw::LogStringArg _instanceArg(instance == Stm32::SpiInstance::Spi1 ? "Spi1" :
                                   instance == Stm32::SpiInstance::Spi2 ? "Spi2" :
@@ -229,10 +312,54 @@ I32 Stm32SpiDriver ::hwTransmitReceive(const U8* txData, U8* rxData, FwSizeType 
     FW_ASSERT(txData != nullptr);
     FW_ASSERT(rxData != nullptr);
 
-    const HAL_StatusTypeDef status =
-        HAL_SPI_TransmitReceive(halHandle, const_cast<U8*>(txData), rxData, static_cast<uint16_t>(size),
-                                 this->m_timeoutMs);
-    return static_cast<I32>(status);
+    if (this->m_transferMode == TransferMode::POLLED) {
+        const HAL_StatusTypeDef status =
+            HAL_SPI_TransmitReceive(halHandle, const_cast<U8*>(txData), rxData, static_cast<uint16_t>(size),
+                                     this->m_timeoutMs);
+        return static_cast<I32>(status);
+    }
+
+    // DMA path: buffers must be reachable by the DMA controller (not DTCM)
+    // and the D-cache must be clean/invalidated around the transfer so the
+    // CPU and DMA controller agree on what's actually in RAM.
+    Stm32::AssertDmaSafe(txData, size);
+    Stm32::AssertDmaSafe(rxData, size);
+    Stm32::CleanDCacheForDma(txData, size);
+
+    this->m_dmaBusy = true;
+    this->m_dmaErrorCode = 0;
+    const HAL_StatusTypeDef startStatus =
+        HAL_SPI_TransmitReceive_DMA(halHandle, const_cast<U8*>(txData), rxData, static_cast<uint16_t>(size));
+    if (startStatus != HAL_OK) {
+        this->m_dmaBusy = false;
+        return static_cast<I32>(startStatus);
+    }
+
+    // Block the caller until HAL_SPI_TxRxCpltCallback()/HAL_SPI_ErrorCallback()
+    // clears m_dmaBusy, or this transfer's own watchdog expires -- this is
+    // what lets DMA mode keep SpiWriteRead's synchronous port contract.
+    Os::RawTime dmaStart;
+    (void)dmaStart.now();
+    const U32 timeoutUs = this->m_timeoutMs * 1000U;
+    constexpr U32 MAX_DMA_POLL_ITERATIONS = 1000000U;  // hard backstop; the time check below is the real bound
+    for (U32 i = 0; this->m_dmaBusy && (i < MAX_DMA_POLL_ITERATIONS); i++) {
+        Os::RawTime now;
+        (void)now.now();
+        U32 elapsedUs = 0;
+        (void)now.getDiffUsec(dmaStart, elapsedUs);
+        if (elapsedUs >= timeoutUs) {
+            break;
+        }
+    }
+
+    if (this->m_dmaBusy) {
+        (void)HAL_SPI_Abort(halHandle);
+        this->m_dmaBusy = false;
+        return static_cast<I32>(HAL_TIMEOUT);
+    }
+
+    Stm32::InvalidateDCacheForDma(rxData, size);
+    return (this->m_dmaErrorCode == 0) ? static_cast<I32>(HAL_OK) : static_cast<I32>(HAL_ERROR);
 }
 
 }  // namespace Stm32

@@ -14,11 +14,14 @@
 extern bool Stub_hwOpenSucceeds = true;               // simulates MX_SPIn_Init()
 extern I32 Stub_hwTransmitReceiveStatus = 0;           // HAL_StatusTypeDef hwTransmitReceive() reports (0 == HAL_OK)
 extern U8 Stub_rxResponseData[32] = {0};               // bytes hwTransmitReceive() copies into the caller's read buffer
+extern bool Stub_dmaCompletes = true;      // DMA mode only: simulates HAL_SPI_TxRxCpltCallback() firing before the timeout
+extern I32 Stub_dmaTimeoutStatus = 3;      // DMA mode only, when Stub_dmaCompletes is false: mirrors real HAL_TIMEOUT (3)
 
 // Observable stub state for unit tests
 extern Stm32::SpiInstance Stub_lastOpenedInstance = Stm32::SpiInstance::Spi5;  // instance most recently passed to open()
 extern Stm32::GpioPort Stub_lastCsPort = Stm32::GpioPort::A;   // csPort most recently passed to open()
 extern U16 Stub_lastCsPin = 0;                                 // csPin most recently passed to open()
+extern Stm32::TransferMode Stub_lastOpenedMode = Stm32::TransferMode::POLLED;  // mode most recently passed to open()
 extern bool Stub_csActiveDuringTransfer = false;  // true iff hwSetCs(true) was in effect when hwTransmitReceive() ran
 extern U8 Stub_lastTxData[32] = {0};
 extern FwSizeType Stub_lastTxLen = 0;
@@ -33,10 +36,15 @@ bool s_csActive = false;
 
 namespace Stm32 {
 
-Fw::Success Stm32SpiDriver ::open(SpiInstance instance, Stm32::GpioPort csPort, U16 csPin, U32 timeoutMs) {
+Fw::Success Stm32SpiDriver ::open(SpiInstance instance,
+                                   Stm32::GpioPort csPort,
+                                   U16 csPin,
+                                   U32 timeoutMs,
+                                   TransferMode mode) {
     Stub_lastOpenedInstance = instance;
     Stub_lastCsPort = csPort;
     Stub_lastCsPin = csPin;
+    Stub_lastOpenedMode = mode;
     if (!Stub_hwOpenSucceeds) {
         return Fw::Success::FAILURE;
     }
@@ -44,6 +52,7 @@ Fw::Success Stm32SpiDriver ::open(SpiInstance instance, Stm32::GpioPort csPort, 
     this->m_csPort = csPort;
     this->m_csPin = csPin;
     this->m_timeoutMs = timeoutMs;
+    this->m_transferMode = mode;
     this->m_opened = true;
 
     Fw::LogStringArg _instanceArg(instance == Stm32::SpiInstance::Spi1 ? "Spi1" :
@@ -68,6 +77,13 @@ I32 Stm32SpiDriver ::hwTransmitReceive(const U8* txData, U8* rxData, FwSizeType 
         Stub_lastTxData[i] = txData[i];
     }
     Stub_lastTxLen = size;
+
+    // DMA mode only: simulate the completion ISR never firing, mirroring the
+    // real hwTransmitReceive()'s watchdog-timeout return without an actual
+    // wall-clock wait on the host.
+    if ((this->m_transferMode == TransferMode::DMA) && !Stub_dmaCompletes) {
+        return Stub_dmaTimeoutStatus;
+    }
 
     const FwSizeType toCopy = (size < sizeof(Stub_rxResponseData)) ? size : sizeof(Stub_rxResponseData);
     for (FwSizeType i = 0; i < toCopy; i++) {

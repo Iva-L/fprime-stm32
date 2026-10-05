@@ -24,18 +24,32 @@ Stm32SpiDriver ::Stm32SpiDriver(const char* const compName)
       m_csPort(Stm32::GpioPort::A),
       m_csPin(0),
       m_timeoutMs(10),
-      m_opened(false) {}
+      m_transferMode(TransferMode::POLLED),
+      m_opened(false),
+      m_dmaBusy(false),
+      m_dmaErrorCode(0) {}
 
 Stm32SpiDriver ::~Stm32SpiDriver() {}
+
+void Stm32SpiDriver ::signalDmaComplete() {
+    this->m_dmaErrorCode = 0;
+    this->m_dmaBusy = false;
+}
+
+void Stm32SpiDriver ::signalDmaError(U32 errorCode) {
+    this->m_dmaErrorCode = errorCode;
+    this->m_dmaBusy = false;
+}
 
 // ----------------------------------------------------------------------
 // Handler implementations for user-defined typed input ports
 // ----------------------------------------------------------------------
 
-// Every sensor payload on this bus is small (6-8 bytes for the BMP280), so a
-// single blocking HAL_SPI_TransmitReceive() bracketed by chip-select is
-// mandatory-simple here -- no DMA, no interrupts, no cache-coherence or
-// AXI SRAM alignment concerns (see docs/sdd.md).
+// Chip-select handling and buffer checks stay mode-agnostic here --
+// hwTransmitReceive() (Stm32SpiDriver.cpp real / Stm32SpiDriverStub.cpp
+// host) is the only place that branches on m_transferMode, so this handler
+// behaves identically whether the instance was opened POLLED or DMA (see
+// docs/sdd.md).
 Drv::SpiStatus Stm32SpiDriver ::SpiWriteRead_handler(FwIndexType portNum, Fw::Buffer& writeBuffer, Fw::Buffer& readBuffer) {
     if (!this->m_opened) {
         return Drv::SpiStatus::SPI_OPEN_ERR;

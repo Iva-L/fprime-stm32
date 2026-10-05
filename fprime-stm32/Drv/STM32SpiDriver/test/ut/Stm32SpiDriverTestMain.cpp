@@ -16,6 +16,36 @@ TEST(Nominal, OpenFailure) {
     tester.testOpenFailure();
 }
 
+TEST(Nominal, OpenDefaultsToPolled) {
+    Stm32::Stm32SpiDriverTester tester;
+    tester.testOpenDefaultsToPolled();
+}
+
+TEST(Nominal, OpenDma) {
+    Stm32::Stm32SpiDriverTester tester;
+    tester.testOpenDma();
+}
+
+TEST(Nominal, SpiWriteReadDmaSuccess) {
+    Stm32::Stm32SpiDriverTester tester;
+    tester.testSpiWriteReadDmaSuccess();
+}
+
+TEST(Nominal, SpiWriteReadDmaFailure) {
+    Stm32::Stm32SpiDriverTester tester;
+    tester.testSpiWriteReadDmaFailure();
+}
+
+TEST(Nominal, SpiWriteReadDmaTimeout) {
+    Stm32::Stm32SpiDriverTester tester;
+    tester.testSpiWriteReadDmaTimeout();
+}
+
+TEST(Nominal, ReopenSwitchesMode) {
+    Stm32::Stm32SpiDriverTester tester;
+    tester.testReopenSwitchesMode();
+}
+
 TEST(Nominal, SpiWriteReadBeforeOpen) {
     Stm32::Stm32SpiDriverTester tester;
     tester.testSpiWriteReadBeforeOpen();
