@@ -23,6 +23,7 @@ jobs:
           repository: nasa/fprime
           ref: 8a42c8b5309acf1a61bb71d6fac62872f26e9990
           path: fprime
+          submodules: recursive
 
       - name: Write throwaway CI project
         run: |
