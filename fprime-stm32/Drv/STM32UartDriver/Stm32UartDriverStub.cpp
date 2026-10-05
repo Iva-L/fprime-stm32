@@ -24,6 +24,11 @@ extern I32 Stub_hwStartTxFailureStatus = 1;    // HAL_StatusTypeDef value report
 
 extern I32 Stub_hwRestartRxStatus = 0;         // HAL_StatusTypeDef value hwRestartRx() reports (0 == HAL_OK)
 
+extern bool Stub_hwPolledTransmitSucceeds = true;  // simulates HAL_UART_Transmit()
+extern U8 Stub_polledRxQueue[Stm32::Stm32UartDriverConfig::RX_STAGING_SIZE] = {0};  // bytes hwPolledReceiveByte() returns, in order
+extern FwSizeType Stub_polledRxQueueLen = 0;       // number of valid bytes queued above
+extern FwSizeType Stub_polledRxQueuePos = 0;       // next index to dequeue
+
 // Observable stub state for unit tests
 extern U8 Stub_lastTxData[Stm32::Stm32UartDriverConfig::TX_STAGING_SIZE] = {0};
 extern FwSizeType Stub_lastTxLen = 0;
@@ -31,6 +36,8 @@ extern U32 Stub_hwAbortTxCallCount = 0;
 extern U32 Stub_hwAbortRxCallCount = 0;
 extern U32 Stub_hwInvalidateRxStagingCallCount = 0;
 extern U32 Stub_hwClearUartErrorCallCount = 0;
+extern U8 Stub_lastPolledTxData[Stm32::Stm32UartDriverConfig::TX_STAGING_SIZE] = {0};
+extern FwSizeType Stub_lastPolledTxLen = 0;
 
 namespace {
 
@@ -46,8 +53,9 @@ constexpr U32 DMA_AFFECTING_ERROR_MASK = 0x10U;
 namespace Stm32 {
 
 bool Stm32UartDriver ::hwOpen(UsartInstance instance, U32 preemptPriority, U32 subPriority, U32 requestedBaudRate,
-                               U32& outActualBaudRate) {
+                               TransferMode mode, U32& outActualBaudRate) {
     Stub_lastOpenedInstance = instance;
+    (void)mode;
 
     if (!Stub_hwOpenSucceeds) {
         // Mirrors the real hwOpen(): the only HAL boundary method that
@@ -101,6 +109,30 @@ void Stm32UartDriver ::hwClearUartError() {
 void Stm32UartDriver ::hwClassifyUartError(U32 errorCode, bool& isRxAffecting, bool& isDmaAffecting) {
     isRxAffecting = (errorCode & RX_AFFECTING_ERROR_MASK) != 0U;
     isDmaAffecting = (errorCode & DMA_AFFECTING_ERROR_MASK) != 0U;
+}
+
+bool Stm32UartDriver ::hwPolledTransmit(const U8* data, FwSizeType len, U32 timeoutMs) {
+    (void)timeoutMs;
+    if (!Stub_hwPolledTransmitSucceeds) {
+        Fw::LogStringArg _op("Transmit");
+        this->log_WARNING_HI_HalError(_op, 1);
+        return false;
+    }
+    const FwSizeType captured = (len < sizeof(Stub_lastPolledTxData)) ? len : sizeof(Stub_lastPolledTxData);
+    for (FwSizeType i = 0; i < captured; i++) {
+        Stub_lastPolledTxData[i] = data[i];
+    }
+    Stub_lastPolledTxLen = len;
+    return true;
+}
+
+bool Stm32UartDriver ::hwPolledReceiveByte(U8& outByte) {
+    if (Stub_polledRxQueuePos >= Stub_polledRxQueueLen) {
+        return false;
+    }
+    outByte = Stub_polledRxQueue[Stub_polledRxQueuePos];
+    Stub_polledRxQueuePos++;
+    return true;
 }
 
 }  // namespace Stm32

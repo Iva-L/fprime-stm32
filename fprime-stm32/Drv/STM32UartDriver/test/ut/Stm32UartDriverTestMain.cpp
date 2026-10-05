@@ -16,6 +16,31 @@ TEST(Nominal, OpenFailure) {
     tester.testOpenFailure();
 }
 
+TEST(Nominal, OpenDefaultsToDma) {
+    Stm32::Stm32UartDriverTester tester;
+    tester.testOpenDefaultsToDma();
+}
+
+TEST(Nominal, OpenPolled) {
+    Stm32::Stm32UartDriverTester tester;
+    tester.testOpenPolled();
+}
+
+TEST(Nominal, SendPolledBypassesRing) {
+    Stm32::Stm32UartDriverTester tester;
+    tester.testSendPolledBypassesRing();
+}
+
+TEST(Nominal, SendPolledTransmitFailure) {
+    Stm32::Stm32UartDriverTester tester;
+    tester.testSendPolledTransmitFailure();
+}
+
+TEST(Nominal, PollRxPolledDrainsBytes) {
+    Stm32::Stm32UartDriverTester tester;
+    tester.testPollRxPolledDrainsBytes();
+}
+
 TEST(Nominal, SendInvalidBuffer) {
     Stm32::Stm32UartDriverTester tester;
     tester.testSendInvalidBuffer();

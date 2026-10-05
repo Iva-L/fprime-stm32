@@ -48,6 +48,29 @@ class Stm32UartDriverTester final : public Stm32UartDriverGTestBase {
     //! initial RX arm fails (hwOpen failure injected via Stub_hwOpenSucceeds)
     void testOpenFailure();
 
+    //! open() without an explicit mode argument defaults to DMA (backward
+    //! compatibility: this is this driver's only behavior before
+    //! TransferMode existed, and the one real USART1 comms link call site
+    //! relies on this)
+    void testOpenDefaultsToDma();
+
+    //! open() succeeds with an explicit POLLED mode request
+    void testOpenPolled();
+
+    //! send() in POLLED mode bypasses the TX ring/DMA entirely: a single
+    //! blocking HAL_UART_Transmit() runs synchronously and the ring stays
+    //! empty (poll()'s pollTx() has nothing to drain)
+    void testSendPolledBypassesRing();
+
+    //! send() in POLLED mode propagates a HAL boundary transmit failure and
+    //! counts a TX error
+    void testSendPolledTransmitFailure();
+
+    //! poll() in POLLED mode drains bytes already queued at the HAL
+    //! boundary (Stub_polledRxQueue) into recv(), the same downstream path
+    //! DMA mode uses once bytes are in the ring
+    void testPollRxPolledDrainsBytes();
+
     //! send() rejects an invalid (unset) Fw::Buffer without touching the ring
     void testSendInvalidBuffer();
 
@@ -101,8 +124,9 @@ class Stm32UartDriverTester final : public Stm32UartDriverGTestBase {
 
     //! Two simultaneously-open Stm32UartDriver instances (different USART
     //! peripherals, e.g. USART1 for the ground link and USART2 for a second
-    //! radio) don't share any mutable state: opening a second instance
-    //! after the first is already open must not disturb the first
+    //! radio, and -- now -- independently DMA or POLLED) don't share any
+    //! mutable state: opening a second instance in POLLED mode after the
+    //! first is already open in DMA mode must not disturb the first
     //! instance's own ability to send.
     void testTwoInstancesDoNotInterfere();
 

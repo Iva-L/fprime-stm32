@@ -213,22 +213,31 @@ extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
 namespace Stm32 {
 
 bool Stm32UartDriver ::hwOpen(UsartInstance instance, U32 preemptPriority, U32 subPriority, U32 requestedBaudRate,
-                               U32& outActualBaudRate) {
+                               TransferMode mode, U32& outActualBaudRate) {
     (void)requestedBaudRate;  // not used to configure the peripheral: CubeMX fixes the baud in usart.c
 
     UART_HandleTypeDef* const halHandle = toHalHandle(instance);
     FW_ASSERT(halHandle != nullptr, static_cast<FwAssertArgType>(instance));
-    const IRQn_Type irqn = toIrqn(instance);
 
-    // DMA1 clock/NVIC must be enabled before HAL_UART_MspInit() (invoked from
-    // MX_USARTn_UART_Init() -> HAL_UART_Init()) links and initializes the
-    // selected instance's TX/RX DMA streams.
-    MX_DMA_Init();
+    if (mode == TransferMode::DMA) {
+        // DMA1 clock/NVIC must be enabled before HAL_UART_MspInit() (invoked
+        // from MX_USARTn_UART_Init() -> HAL_UART_Init()) links and
+        // initializes the selected instance's TX/RX DMA streams.
+        MX_DMA_Init();
+    }
     callInstanceInit(instance);
+
+    if (mode == TransferMode::POLLED) {
+        // No DMA stream, no idle-line detection, no ISR callback routing --
+        // the peripheral itself is all a POLLED instance needs.
+        outActualBaudRate = halHandle->Init.BaudRate;
+        return true;
+    }
 
     // Not configured by CubeMX: the USART global interrupt is required for
     // HAL_UARTEx_ReceiveToIdle_DMA()'s idle-line detection, which only the
     // USART peripheral (not the DMA streams) can signal.
+    const IRQn_Type irqn = toIrqn(instance);
     HAL_NVIC_SetPriority(irqn, preemptPriority, subPriority);
     HAL_NVIC_EnableIRQ(irqn);
 
@@ -254,6 +263,29 @@ bool Stm32UartDriver ::hwOpen(UsartInstance instance, U32 preemptPriority, U32 s
 
     outActualBaudRate = halHandle->Init.BaudRate;
     return true;
+}
+
+bool Stm32UartDriver ::hwPolledTransmit(const U8* data, FwSizeType len, U32 timeoutMs) {
+    UART_HandleTypeDef* const halHandle = toHalHandle(this->m_instance);
+    FW_ASSERT(halHandle != nullptr);
+    const HAL_StatusTypeDef status =
+        HAL_UART_Transmit(halHandle, const_cast<U8*>(data), static_cast<uint16_t>(len), timeoutMs);
+    if (status != HAL_OK) {
+        Fw::LogStringArg _op("Transmit");
+        this->log_WARNING_HI_HalError(_op, static_cast<I32>(status));
+        return false;
+    }
+    return true;
+}
+
+bool Stm32UartDriver ::hwPolledReceiveByte(U8& outByte) {
+    UART_HandleTypeDef* const halHandle = toHalHandle(this->m_instance);
+    FW_ASSERT(halHandle != nullptr);
+    // Timeout 0: return immediately with HAL_TIMEOUT if no byte is already
+    // in the peripheral's data register, instead of blocking poll() -- this
+    // is a non-blocking peek, not a watchdog-bounded wait.
+    const HAL_StatusTypeDef status = HAL_UART_Receive(halHandle, &outByte, 1, 0);
+    return status == HAL_OK;
 }
 
 bool Stm32UartDriver ::hwStartTx(const U8* data, FwSizeType len) {
