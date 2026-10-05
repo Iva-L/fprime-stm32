@@ -53,6 +53,21 @@ class Stm32I2cDriverTester final : public Stm32I2cDriverGTestBase {
     //! boundary's init fails (injected via Stub_hwOpenSucceeds)
     void testOpenFailure();
 
+    //! open() without an explicit mode argument defaults to POLLED (backward compatibility)
+    void testOpenDefaultsToPolled();
+
+    //! open() forwards an explicit DMA mode request to the HAL boundary
+    void testOpenDma();
+
+    //! write()/read() in DMA mode perform the same logical transaction as
+    //! POLLED once the completion callback fires
+    void testWriteDmaSuccess();
+    void testReadDmaSuccess();
+
+    //! write() in DMA mode times out and reports an error when the
+    //! completion callback never fires (injected via Stub_dmaCompletes)
+    void testWriteDmaTimeout();
+
     //! write()/read()/writeRead() before open() all report I2C_OPEN_ERR
     void testWriteBeforeOpen();
     void testReadBeforeOpen();
@@ -90,9 +105,10 @@ class Stm32I2cDriverTester final : public Stm32I2cDriverGTestBase {
     //! successful write
     void testWriteReadReceiveFailure();
 
-    //! Two simultaneously-open Stm32I2cDriver instances (different buses)
-    //! don't share any mutable state: opening a second instance on I2c2
-    //! after the first is already open on I2c1 must not disturb the first
+    //! Two simultaneously-open Stm32I2cDriver instances (different buses,
+    //! and -- now -- independently POLLED or DMA) don't share any mutable
+    //! state: opening a second instance on I2c2 in DMA mode after the first
+    //! is already open on I2c1 in POLLED mode must not disturb the first
     //! instance's own ability to transact.
     void testTwoInstancesDoNotInterfere();
 

@@ -26,6 +26,31 @@ TEST(Nominal, OpenFailure) {
     tester.testOpenFailure();
 }
 
+TEST(Nominal, OpenDefaultsToPolled) {
+    Stm32::Stm32I2cDriverTester tester;
+    tester.testOpenDefaultsToPolled();
+}
+
+TEST(Nominal, OpenDma) {
+    Stm32::Stm32I2cDriverTester tester;
+    tester.testOpenDma();
+}
+
+TEST(Nominal, WriteDmaSuccess) {
+    Stm32::Stm32I2cDriverTester tester;
+    tester.testWriteDmaSuccess();
+}
+
+TEST(Nominal, ReadDmaSuccess) {
+    Stm32::Stm32I2cDriverTester tester;
+    tester.testReadDmaSuccess();
+}
+
+TEST(Nominal, WriteDmaTimeout) {
+    Stm32::Stm32I2cDriverTester tester;
+    tester.testWriteDmaTimeout();
+}
+
 TEST(Nominal, WriteBeforeOpen) {
     Stm32::Stm32I2cDriverTester tester;
     tester.testWriteBeforeOpen();

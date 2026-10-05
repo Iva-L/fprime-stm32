@@ -14,6 +14,7 @@
 #include <Fw/Types/LogicEnumAc.hpp>
 #include <Fw/Types/Assert.hpp>
 #include <config/Stm32Config.hpp>
+#include <config/Stm32TransferMode.hpp>
 
 namespace Stm32 {
 
@@ -49,27 +50,51 @@ class Stm32I2cDriver final : public Stm32I2cDriverComponentBase {
     //! \param instance which I2C peripheral this driver instance owns
     //! \param busSpeed requested bus clock preset (default matches this
     //!        project's current 400 kHz Fast-mode configuration)
+    //! \param mode POLLED (default) issues a single
+    //!        blocking HAL_I2C_Master_Transmit/Receive() per transaction;
+    //!        DMA issues the _DMA variant and blocks the caller until the
+    //!        ISR-signaled completion (or TRANSACTION_TIMEOUT_MS), with
+    //!        D-cache maintenance and a DMA-safe-buffer check around it --
+    //!        the port's synchronous contract is identical either way.
     //! Runs MX_I2Cn_Init() for the selected instance and applies the requested
     //! bus speed preset (re-running HAL_I2C_Init() if it differs from
-    //! CubeMX's baked-in default). No NVIC configuration: this driver is
-    //! polled-only. Implemented directly in Stm32I2cDriver.cpp (real) /
+    //! CubeMX's baked-in default). NVIC configuration only happens when
+    //! `mode` is DMA (needed for the I2C event/error IRQ that signals DMA
+    //! completion). Implemented directly in Stm32I2cDriver.cpp (real) /
     //! Stm32I2cDriverStub.cpp (host), since it is the HAL boundary itself.
-    Fw::Success open(I2cInstance instance, I2cBusSpeed busSpeed = I2cBusSpeed::Fast);
+    Fw::Success open(I2cInstance instance, I2cBusSpeed busSpeed = I2cBusSpeed::Fast,
+                      TransferMode mode = TransferMode::POLLED);
+
+    // ----------------------------------------------------------------------
+    // ISR signal surface: called by the real HAL callback trampoline (free
+    // functions with no user-context pointer) on the stm32h7 target when
+    // this instance is open in DMA mode. A unit test may also call these
+    // directly to simulate a hardware event, since no ISR exists on the
+    // host.
+    // ----------------------------------------------------------------------
+
+    //! Signal that the in-flight Transmit/Receive DMA transaction completed successfully.
+    void signalDmaComplete();
+
+    //! Signal that the I2C/DMA latched the given HAL error code.
+    void signalDmaError(U32 errorCode);
 
   private:
     //! Bounded per-transaction watchdog passed to every blocking HAL_I2C_*
     //! call (Checklist Week 10: "10 ms transaction watchdog").
     static constexpr U32 TRANSACTION_TIMEOUT_MS = 10;
 
-    //! Blocking (polled) master write of `len` bytes to `devAddress`,
-    //! bounded by TRANSACTION_TIMEOUT_MS. Returns I2C_OK, I2C_ADDRESS_ERR
-    //! (address-phase NACK), or I2C_WRITE_ERR; emits HalError itself on
-    //! failure, since only this method knows the raw HAL_StatusTypeDef.
+    //! Master write of `len` bytes to `devAddress`, bounded by
+    //! TRANSACTION_TIMEOUT_MS, in either POLLED or DMA mode (branches on
+    //! m_transferMode). Returns I2C_OK, I2C_ADDRESS_ERR (address-phase
+    //! NACK), or I2C_WRITE_ERR; emits HalError itself on failure, since
+    //! only this method knows the raw HAL_StatusTypeDef.
     Drv::I2cStatus hwMasterTransmit(U16 devAddress, U8* data, U16 len);
 
-    //! Blocking (polled) master read of `len` bytes from `devAddress`,
-    //! bounded by TRANSACTION_TIMEOUT_MS. Returns I2C_OK, I2C_ADDRESS_ERR,
-    //! or I2C_READ_ERR. Same error-reporting convention as hwMasterTransmit().
+    //! Master read of `len` bytes from `devAddress`, bounded by
+    //! TRANSACTION_TIMEOUT_MS, in either POLLED or DMA mode. Returns I2C_OK,
+    //! I2C_ADDRESS_ERR, or I2C_READ_ERR. Same error-reporting convention as
+    //! hwMasterTransmit().
     Drv::I2cStatus hwMasterReceive(U16 devAddress, U8* data, U16 len);
 
     // ----------------------------------------------------------------------
@@ -93,8 +118,14 @@ class Stm32I2cDriver final : public Stm32I2cDriverComponentBase {
                                       Fw::Buffer& readBuffer) override;
 
     I2cInstance m_instance;
+    TransferMode m_transferMode;
 
     bool m_opened;
+
+    //! Completion/error state latched by signalDmaComplete()/signalDmaError()
+    //! and consumed by hwMasterTransmit()/hwMasterReceive()'s DMA-mode busy-wait.
+    volatile bool m_dmaBusy;
+    U32 m_dmaErrorCode;
 };
 
 }  // namespace Stm32
