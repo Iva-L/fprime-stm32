@@ -1,0 +1,68 @@
+name: fprime-baremetal-reference CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-fprime-baremetal-reference:
+    name: Cross-Compile fprime-baremetal-reference and test (STM32H7)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install ARM GNU Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-dev
+
+      - name: Install F' Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r lib/fprime/requirements.txt
+
+      - name: Verify Environment
+        run: |
+          arm-none-eabi-gcc --version
+          arm-none-eabi-g++ --version
+
+      - name: Generate CMake Cache
+        run: |
+          # Generates build files targeting stm32h7 baremetal platform
+          fprime-util generate -f stm32h7
+
+      - name: Cross-Compile F' Binary
+        run: |
+          # Builds the ReferenceDeployment executable
+          fprime-util build stm32h7
+
+      - name: Generate Unit Test CMake Cache
+        run: |
+          # Generates build files for unit tests
+          fprime-util generate --ut stm32h7
+
+      - name: Run Drv/STM32UartDriver Host Tests
+        run: |
+          # Navigate to the STM32UartDriver component directory and run host tests
+          cd $GITHUB_WORKSPACE/fprime-stm32/Drv/STM32UartDriver && fprime-util check --coverage
+
+      - name: Run Drv/STM32Timer Host Tests
+        run: |
+          # Navigate to the STM32Timer component directory and run host tests
+          cd $GITHUB_WORKSPACE/fprime-stm32/Drv/STM32Timer && fprime-util check --coverage
+          
+      - name: Run Drv/STM32GpioDriver Host Tests
+        run: |
+          # Navigate to the STM32GpioDriver component directory and run host tests
+          cd $GITHUB_WORKSPACE/fprime-stm32/Drv/STM32GpioDriver && fprime-util check --coverage
