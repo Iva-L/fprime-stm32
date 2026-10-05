@@ -243,8 +243,16 @@ Drv::I2cStatus Stm32I2cDriver ::hwMasterTransmit(U16 devAddress, U8* data, U16 l
         this->m_dmaErrorCode = 0;
         status = HAL_I2C_Master_Transmit_DMA(halHandle, static_cast<uint16_t>(devAddress << 1U), data, len);
         if (status == HAL_OK) {
-            if (!waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS)) {
+
+            this->unLock();
+            const bool completed = waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS);
+            if (!completed) {
                 (void)HAL_I2C_Master_Abort_IT(halHandle, static_cast<uint16_t>(devAddress << 1U));
+                // The abort itself completes via the same interrupts.
+                (void)waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS);
+            }
+            this->lock();
+            if (!completed) {
                 this->m_dmaBusy = false;
                 status = HAL_TIMEOUT;
             } else {
@@ -280,8 +288,17 @@ Drv::I2cStatus Stm32I2cDriver ::hwMasterReceive(U16 devAddress, U8* data, U16 le
         this->m_dmaErrorCode = 0;
         status = HAL_I2C_Master_Receive_DMA(halHandle, static_cast<uint16_t>(devAddress << 1U), data, len);
         if (status == HAL_OK) {
-            if (!waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS)) {
+            // See the identical comment in hwMasterTransmit(): this
+            // guarded port's lock() disables every maskable interrupt, so
+            // the completion ISR can never run unless we unlock first.
+            this->unLock();
+            const bool completed = waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS);
+            if (!completed) {
                 (void)HAL_I2C_Master_Abort_IT(halHandle, static_cast<uint16_t>(devAddress << 1U));
+                (void)waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS);
+            }
+            this->lock();
+            if (!completed) {
                 this->m_dmaBusy = false;
                 status = HAL_TIMEOUT;
             } else {

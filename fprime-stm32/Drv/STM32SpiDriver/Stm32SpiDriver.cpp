@@ -338,6 +338,8 @@ I32 Stm32SpiDriver ::hwTransmitReceive(const U8* txData, U8* rxData, FwSizeType 
     // Block the caller until HAL_SPI_TxRxCpltCallback()/HAL_SPI_ErrorCallback()
     // clears m_dmaBusy, or this transfer's own watchdog expires -- this is
     // what lets DMA mode keep SpiWriteRead's synchronous port contract.
+
+    this->unLock();
     Os::RawTime dmaStart;
     (void)dmaStart.now();
     const U32 timeoutUs = this->m_timeoutMs * 1000U;
@@ -354,10 +356,22 @@ I32 Stm32SpiDriver ::hwTransmitReceive(const U8* txData, U8* rxData, FwSizeType 
 
     if (this->m_dmaBusy) {
         (void)HAL_SPI_Abort(halHandle);
+        // The abort itself completes via the same interrupt.
+        for (U32 i = 0; this->m_dmaBusy && (i < MAX_DMA_POLL_ITERATIONS); i++) {
+            Os::RawTime now;
+            (void)now.now();
+            U32 elapsedUs = 0;
+            (void)now.getDiffUsec(dmaStart, elapsedUs);
+            if (elapsedUs >= timeoutUs) {
+                break;
+            }
+        }
         this->m_dmaBusy = false;
+        this->lock();
         return static_cast<I32>(HAL_TIMEOUT);
     }
 
+    this->lock();
     Stm32::InvalidateDCacheForDma(rxData, size);
     return (this->m_dmaErrorCode == 0) ? static_cast<I32>(HAL_OK) : static_cast<I32>(HAL_ERROR);
 }
