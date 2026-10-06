@@ -22,6 +22,8 @@
 
 `import Drv.I2c` provides `write`/`read`/`writeRead` as guarded, synchronous input ports; each returns a `Drv::I2cStatus` to the caller directly, so there is no completion port and no telemetry. The only event is `HalError`, emitted from the HAL boundary whenever a blocking `HAL_I2C_*` call does not return `HAL_OK`.
 
+These ports are deliberately `guarded`, not just `sync`: F´'s generated `*_handlerBase()` wrapper calls `this->lock()` before invoking the handler and `this->unLock()` after, serializing concurrent callers from different call contexts into this component's internal state (`m_dmaBusy`, `m_dmaErrorCode`, the re-resolved HAL handle) -- the same protection every guarded F´ port provides. See §3.6 for why DMA mode has to temporarily *undo* that lock partway through the call, and why that's safe on this target.
+
 ### 3.2 Common/Real/Stub split
 
 Following the convention in `lib/fprime-stm32/README.md`, this driver splits into three files sharing one HAL-free header (`Stm32I2cDriver.hpp`):
@@ -58,6 +60,14 @@ Both branch on `m_transferMode`:
 - **DMA**: `Stm32::AssertDmaSafe()` on the buffer (it must not overlap DTCM), `Stm32::CleanDCacheForDma()` on a write, `HAL_I2C_Master_Transmit_DMA()`/`HAL_I2C_Master_Receive_DMA()`, then a bounded busy-wait (an `Os::RawTime`-timed loop, capped by `TRANSACTION_TIMEOUT_MS`) on a `volatile` flag that `HAL_I2C_MasterTxCpltCallback()`/`HAL_I2C_MasterRxCpltCallback()`/`HAL_I2C_ErrorCallback()` clear from the ISR. On timeout, `HAL_I2C_Master_Abort_IT()` runs and the caller sees the same error reporting as any other HAL failure. On a successful receive, `Stm32::InvalidateDCacheForDma()` runs on the read buffer before returning.
 
 **Known limitation**: this project's current CubeMX configuration for I2C1 has no DMA request attached (`lib/fprime-stm32/src/i2c.c`'s `HAL_I2C_MspInit()` never calls `__HAL_LINKDMA()`), so `open(..., TransferMode::DMA)` on I2C1 will fail its `hdmatx`/`hdmarx` assertion today rather than silently dereferencing a null DMA handle during a transaction. Using DMA mode on real hardware requires regenerating the CubeMX project with a DMA request added to the target I2C instance first -- the same prerequisite §3.3 already documents for enabling an instance beyond I2C1 at all.
+
+### 3.6 Guarded ports and the DMA completion wait (`lock()`/`unLock()`)
+
+`lock()`/`unLock()` are called in exactly two functions: `hwMasterTransmit()` and `hwMasterReceive()` (`Stm32I2cDriver.cpp`), and only inside each one's `DMA` branch -- never in the `POLLED` branch, and never anywhere in `Stm32I2cDriverCommon.cpp`. `write_handler()`/`read_handler()`/`writeRead_handler()` stay exactly as described in §3.4, oblivious to locking; they only ever reach `this->lock()`/`unLock()` indirectly, once, through the F´-generated `*_handlerBase()` wrapper around the whole guarded call (§3.1).
+
+On this bare-metal target, `lock()`/`unLock()` resolve to `Os::Mutex::take()`/`release()` (`Os/Stm32H7/Mutex.cpp`), which preserve/restore `PRIMASK` around `__disable_irq()` -- *every* maskable interrupt is globally disabled for as long as the lock is held, not just an I2C-specific one. That's harmless for the `POLLED` path (a single blocking `HAL_I2C_Master_Transmit`/`_Receive` call needs no interrupt to complete), but it is fatal for the `DMA` path exactly as implemented: `HAL_I2C_MasterTxCpltCallback()`/`HAL_I2C_MasterRxCpltCallback()`/`HAL_I2C_ErrorCallback()` only run because `I2C1_EV_IRQn`/`I2C1_ER_IRQn` fire -- interrupts `lock()` would be masking for the handler's entire guarded call. Left locked, the busy-wait in `waitForI2cDma()` would spin to its own timeout on *every* DMA transaction, unconditionally, regardless of whether the hardware/CubeMX wiring is otherwise correct -- which is exactly what happened the first time this path was exercised on real hardware.
+
+`hwMasterTransmit()`/`hwMasterReceive()` therefore call `this->unLock()` immediately before `waitForI2cDma()` (and keep it unlocked through the post-abort re-wait, if the first wait timed out), then `this->lock()` immediately after -- before touching `m_dmaBusy`/`m_dmaErrorCode` or returning. This is safe specifically because this executive is cooperative and non-preemptive: nothing but an ISR can run while the port is momentarily unlocked, and this codebase's ISRs never make F´ port calls (the same constraint `Stm32UartDriver` documents for its own callbacks), so no second caller can ever race into this guarded port during that window. A design that allowed true concurrent/preemptive callers would need a different mechanism here -- this one depends on there being exactly one execution context other than ISRs.
 
 ## 4. Usage
 
