@@ -20,6 +20,9 @@ extern U16 Stub_lastDevAddress;
 extern U8 Stub_lastWriteData[32];
 extern U16 Stub_lastWriteLen;
 extern U16 Stub_lastReadLen;
+extern bool Stub_dmaCompletes;
+extern Drv::I2cStatus Stub_dmaTimeoutI2cStatus;
+extern Stm32::TransferMode Stub_lastOpenedMode;
 
 namespace Stm32 {
 
@@ -54,6 +57,9 @@ void Stm32I2cDriverTester ::resetStubState() {
     }
     Stub_lastWriteLen = 0;
     Stub_lastReadLen = 0;
+    Stub_dmaCompletes = true;
+    Stub_dmaTimeoutI2cStatus = Drv::I2cStatus::I2C_WRITE_ERR;
+    Stub_lastOpenedMode = Stm32::TransferMode::POLLED;
 }
 
 // ----------------------------------------------------------------------
@@ -96,6 +102,53 @@ void Stm32I2cDriverTester ::testOpenFailure() {
     U8 backing[4] = {0};
     Fw::Buffer buffer(backing, sizeof(backing));
     ASSERT_EQ(this->invoke_to_write(0, 0x50, buffer), Drv::I2cStatus::I2C_OPEN_ERR);
+}
+
+void Stm32I2cDriverTester ::testOpenDefaultsToPolled() {
+    const Fw::Success status = this->component.open(I2cInstance::I2c1);
+    ASSERT_EQ(status, Fw::Success::SUCCESS);
+    ASSERT_EQ(Stub_lastOpenedMode, Stm32::TransferMode::POLLED);
+}
+
+void Stm32I2cDriverTester ::testOpenDma() {
+    const Fw::Success status = this->component.open(I2cInstance::I2c1, I2cBusSpeed::Fast, Stm32::TransferMode::DMA);
+    ASSERT_EQ(status, Fw::Success::SUCCESS);
+    ASSERT_EQ(Stub_lastOpenedMode, Stm32::TransferMode::DMA);
+}
+
+void Stm32I2cDriverTester ::testWriteDmaSuccess() {
+    (void)this->component.open(I2cInstance::I2c1, I2cBusSpeed::Fast, Stm32::TransferMode::DMA);
+
+    U8 data[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    Fw::Buffer buffer(data, sizeof(data));
+    const Drv::I2cStatus status = this->invoke_to_write(0, 0x50, buffer);
+    ASSERT_EQ(status, Drv::I2cStatus::I2C_OK);
+    ASSERT_EQ(Stub_lastDevAddress, 0x50);
+    ASSERT_EQ(Stub_lastWriteLen, 4u);
+}
+
+void Stm32I2cDriverTester ::testReadDmaSuccess() {
+    (void)this->component.open(I2cInstance::I2c1, I2cBusSpeed::Fast, Stm32::TransferMode::DMA);
+    Stub_readResponseData[0] = 0x11;
+    Stub_readResponseData[1] = 0x22;
+
+    U8 backing[2] = {0};
+    Fw::Buffer buffer(backing, sizeof(backing));
+    const Drv::I2cStatus status = this->invoke_to_read(0, 0x50, buffer);
+    ASSERT_EQ(status, Drv::I2cStatus::I2C_OK);
+    ASSERT_EQ(backing[0], 0x11);
+    ASSERT_EQ(backing[1], 0x22);
+}
+
+void Stm32I2cDriverTester ::testWriteDmaTimeout() {
+    (void)this->component.open(I2cInstance::I2c1, I2cBusSpeed::Fast, Stm32::TransferMode::DMA);
+    Stub_dmaCompletes = false;
+    Stub_dmaTimeoutI2cStatus = Drv::I2cStatus::I2C_WRITE_ERR;
+
+    U8 data[1] = {0x00};
+    Fw::Buffer buffer(data, sizeof(data));
+    const Drv::I2cStatus status = this->invoke_to_write(0, 0x50, buffer);
+    ASSERT_EQ(status, Drv::I2cStatus::I2C_WRITE_ERR);
 }
 
 void Stm32I2cDriverTester ::testWriteBeforeOpen() {
@@ -258,19 +311,23 @@ void Stm32I2cDriverTester ::testWriteReadReceiveFailure() {
 }
 
 void Stm32I2cDriverTester ::testTwoInstancesDoNotInterfere() {
-    (void)this->component.open(I2cInstance::I2c1);
+    (void)this->component.open(I2cInstance::I2c1, I2cBusSpeed::Fast, Stm32::TransferMode::POLLED);
 
-    // A second, freestanding instance on a different bus. Before the
-    // multi-instance fix, the real HAL boundary cached the resolved handle
-    // in file-static state shared by every Stm32I2cDriver in the process --
-    // opening this second instance would have silently repointed the first
-    // instance's own subsequent transactions.
+    // A second, freestanding instance on a different bus, opened in DMA
+    // mode -- m_transferMode (and the DMA-only registry entry it causes)
+    // must be per-instance state. Before the multi-instance fix, the real
+    // HAL boundary cached the resolved handle in file-static state shared
+    // by every Stm32I2cDriver in the process -- opening this second
+    // instance would have silently repointed the first instance's own
+    // subsequent transactions.
     Stm32I2cDriver secondComponent("Stm32I2cDriverSecond");
-    const Fw::Success secondOpenStatus = secondComponent.open(I2cInstance::I2c2);
+    const Fw::Success secondOpenStatus = secondComponent.open(I2cInstance::I2c2, I2cBusSpeed::Fast, Stm32::TransferMode::DMA);
     ASSERT_EQ(secondOpenStatus, Fw::Success::SUCCESS);
 
     // The first instance must still be fully functional, unaffected by the
-    // second instance's later open().
+    // second instance's later open(), and still POLLED (Stub_dmaCompletes
+    // being irrelevant to it proves this).
+    Stub_dmaCompletes = false;
     U8 backing[2] = {0xAA, 0xBB};
     Fw::Buffer buffer(backing, sizeof(backing));
     const Drv::I2cStatus status = this->invoke_to_write(0, 0x50, buffer);

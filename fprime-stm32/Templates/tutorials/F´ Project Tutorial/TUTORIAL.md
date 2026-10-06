@@ -671,7 +671,9 @@ void configureTopology() {
     // Command sequencer needs to allocate memory to hold contents of command sequences
     cmdSeq.allocateBuffer(0, Stm32::getBootstrapAllocator(), 5 * 1024);
 
-    // PrmDb file name must be supplied by the using topology
+    // PrmDb file name must be supplied by the using topology. MicroFs only accepts canonical
+    // "/bin<N>/file<M>" paths, so alias the human-readable name onto a bin0 slot.
+    Os::Baremetal::MicroFs::registerAlias("PrmDb.dat", "/bin0/file1");
     FileHandling::prmDb.configure("PrmDb.dat");
 
     // Open the UART driver using the USART1 instance and the specified interrupt priorities and baud rate.
@@ -760,7 +762,7 @@ Re-run this same command (it's the same one from step 7.6) any time after creati
 1. **Project's root `CMakeLists.txt`** (one level above `Stm32h7Project/`): enables the ASM language (the startup file `sync` writes into `Hardware/startup/` is a `.s` assembly file; CMake won't compile it otherwise), and adds `config/` to the project's build graph.
 2. **Namespace `CMakeLists.txt`** (`Stm32h7Project/CMakeLists.txt`): adds `Hardware/` to the project's build graph, so the `FprimeStm32` target it defines actually gets built.
 3. **The deployment's own `CMakeLists.txt`**: adds `restrict_platforms(stm32h7)` (keeps a native/host build from even trying to configure this ARM-only deployment); adds `${FPRIME_STM32_STARTUP_SOURCE}`/`${FPRIME_STM32_IT_SOURCE}` to `SOURCES` — compiling them directly into the deployment (rather than only through the archived `FprimeStm32` static library) guarantees their strong ISR definitions override the startup file's weak `Default_Handler` aliases; adds `FprimeStm32`/`FprimeStm32Config`/`FprimeStm32Allocator`/`Os_Baremetal_OverrideNewDelete` to `DEPENDS` (the HAL library, the peripheral-selection header, the fixed-pool bootstrap allocator, and the `operator new`/`delete` overrides `Stm32h7DeploymentTopology.cpp` needs); and appends a `target_link_options(...)` block wiring in `${FPRIME_STM32_LINKER_SCRIPT}`, `-Wl,--gc-sections`, a list of `-Wl,--undefined=...` symbols that force the linker to always pull in the `operator new`/`delete` overrides even though nothing in the topology graph references them directly (without this, a bare-metal build has no heap and `new`/`delete` silently resolve to nothing), and `--specs=nosys.specs` (the newlib stub syscalls this bare-metal target needs at link time).
-4. **The deployment's `Top/CMakeLists.txt`**: adds `FprimeStm32Allocator` to `DEPENDS`, since `Stm32h7DeploymentTopology.cpp` calls `Stm32::getBootstrapAllocator()`/`Stm32::lockBootstrapAllocator()`.
+4. **The deployment's `Top/CMakeLists.txt`**: adds `FprimeStm32Allocator` to `DEPENDS`, since `Stm32h7DeploymentTopology.cpp` calls `Stm32::getBootstrapAllocator()`/`Stm32::lockBootstrapAllocator()`; and adds `fprime-baremetal-config` to `DEPENDS`, since `Stm32h7DeploymentTopology.cpp` calls `Os::Baremetal::MicroFs::*` directly (bin setup, `registerAlias`) rather than going through the generic `Os::File`/`Os::FileSystem` abstraction, so this header isn't picked up through the usual OS-implementation-selection path.
 
 Add `--dry-run` first if you want to preview these four diffs before writing them.
 
@@ -866,7 +868,7 @@ If you are using VSCode, you can integrate the flashing process into your develo
             "type": "cortex-debug",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build-artifacts/stm32h7 Stm32h7Project_Deployments_Stm32h7Deployment/bin Stm32h7Project_Deployments_Stm32h7Deployment",
+            "executable": "${workspaceFolder}/build-artifacts/stm32h7/Stm32h7Project_Deployments_Stm32h7Deployment/bin Stm32h7Project_Deployments_Stm32h7Deployment",
             "servertype": "stlink", 
             "device": "STM32H753XI",
             "interface": "swd",
@@ -886,6 +888,13 @@ which arm-none-eabi-gdb
 which ST-LINK_gdbserver
 which STM32CubeProgrammer
 ```
+
+>[!TIP] 
+>Remember that you can test your program using the native fprime-gds with:
+> ```shell
+> #In stm32h7-project
+> fprime-gds --dictionary build-artifacts/stm32h7/Stm32h7Project_Deployments_Stm32h7Deployment/dict/Stm32h7Project_Deployments_Stm32h7DeploymentTopologyDictionary.json --communication-selection uart --uart-device /dev/ttyACM0 --uart-baud 115200 --no-app
+> ```
 
 ## 11. Conclusion
 

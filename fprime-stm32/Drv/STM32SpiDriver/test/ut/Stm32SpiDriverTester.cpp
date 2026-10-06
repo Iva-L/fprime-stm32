@@ -19,6 +19,9 @@ extern U16 Stub_lastCsPin;
 extern bool Stub_csActiveDuringTransfer;
 extern U8 Stub_lastTxData[32];
 extern FwSizeType Stub_lastTxLen;
+extern bool Stub_dmaCompletes;
+extern I32 Stub_dmaTimeoutStatus;
+extern Stm32::TransferMode Stub_lastOpenedMode;
 
 namespace Stm32 {
 
@@ -52,6 +55,9 @@ void Stm32SpiDriverTester ::resetStubState() {
         Stub_lastTxData[i] = 0;
     }
     Stub_lastTxLen = 0;
+    Stub_dmaCompletes = true;
+    Stub_dmaTimeoutStatus = 3;
+    Stub_lastOpenedMode = Stm32::TransferMode::POLLED;
 }
 
 // ----------------------------------------------------------------------
@@ -73,6 +79,89 @@ void Stm32SpiDriverTester ::testOpenFailure() {
     const Fw::Success status = this->component.open(SpiInstance::Spi5, Stm32::GpioPort::F, 6);
     ASSERT_EQ(status, Fw::Success::FAILURE);
     ASSERT_EVENTS_PortOpened_SIZE(0);
+}
+
+void Stm32SpiDriverTester ::testOpenDefaultsToPolled() {
+    const Fw::Success status = this->component.open(SpiInstance::Spi5, Stm32::GpioPort::F, 6);
+    ASSERT_EQ(status, Fw::Success::SUCCESS);
+    ASSERT_EQ(Stub_lastOpenedMode, Stm32::TransferMode::POLLED);
+}
+
+void Stm32SpiDriverTester ::testOpenDma() {
+    const Fw::Success status =
+        this->component.open(SpiInstance::Spi5, Stm32::GpioPort::F, 6, 10, Stm32::TransferMode::DMA);
+    ASSERT_EQ(status, Fw::Success::SUCCESS);
+    ASSERT_EQ(Stub_lastOpenedMode, Stm32::TransferMode::DMA);
+}
+
+void Stm32SpiDriverTester ::testSpiWriteReadDmaSuccess() {
+    (void)this->component.open(SpiInstance::Spi5, Stm32::GpioPort::F, 6, 10, Stm32::TransferMode::DMA);
+    Stub_rxResponseData[0] = 0x58;
+    Stub_rxResponseData[1] = 0x11;
+
+    U8 wdata[2] = {0xD0, 0x00};
+    U8 rbacking[2] = {0};
+    Fw::Buffer writeBuffer(wdata, sizeof(wdata));
+    Fw::Buffer readBuffer(rbacking, sizeof(rbacking));
+    const Drv::SpiStatus status = this->invoke_to_SpiWriteRead(0, writeBuffer, readBuffer);
+    ASSERT_EQ(status, Drv::SpiStatus::SPI_OK);
+    ASSERT_TRUE(Stub_csActiveDuringTransfer);
+    ASSERT_EQ(Stub_lastTxLen, 2u);
+    ASSERT_EQ(Stub_lastTxData[0], 0xD0);
+    ASSERT_EQ(rbacking[0], 0x58);
+    ASSERT_EQ(rbacking[1], 0x11);
+}
+
+void Stm32SpiDriverTester ::testSpiWriteReadDmaFailure() {
+    (void)this->component.open(SpiInstance::Spi5, Stm32::GpioPort::F, 6, 10, Stm32::TransferMode::DMA);
+    Stub_hwTransmitReceiveStatus = 1;  // DMA "completed" but the latched error code was non-zero
+
+    U8 wdata[1] = {0xD0};
+    U8 rbacking[1] = {0};
+    Fw::Buffer writeBuffer(wdata, sizeof(wdata));
+    Fw::Buffer readBuffer(rbacking, sizeof(rbacking));
+    const Drv::SpiStatus status = this->invoke_to_SpiWriteRead(0, writeBuffer, readBuffer);
+    ASSERT_EQ(status, Drv::SpiStatus::SPI_WRITE_ERR);
+    ASSERT_EVENTS_HalError_SIZE(1);
+    ASSERT_EVENTS_HalError(0, "TransmitReceive", 1);
+}
+
+void Stm32SpiDriverTester ::testSpiWriteReadDmaTimeout() {
+    (void)this->component.open(SpiInstance::Spi5, Stm32::GpioPort::F, 6, 10, Stm32::TransferMode::DMA);
+    Stub_dmaCompletes = false;
+    Stub_dmaTimeoutStatus = 3;  // mirrors real HAL_TIMEOUT
+
+    U8 wdata[1] = {0xD0};
+    U8 rbacking[1] = {0};
+    Fw::Buffer writeBuffer(wdata, sizeof(wdata));
+    Fw::Buffer readBuffer(rbacking, sizeof(rbacking));
+    const Drv::SpiStatus status = this->invoke_to_SpiWriteRead(0, writeBuffer, readBuffer);
+    ASSERT_EQ(status, Drv::SpiStatus::SPI_WRITE_ERR);
+    ASSERT_EVENTS_HalError_SIZE(1);
+    ASSERT_EVENTS_HalError(0, "TransmitReceive", 3);
+}
+
+void Stm32SpiDriverTester ::testReopenSwitchesMode() {
+    (void)this->component.open(SpiInstance::Spi5, Stm32::GpioPort::F, 6, 10, Stm32::TransferMode::POLLED);
+    Stub_rxResponseData[0] = 0x11;
+    U8 wdata1[1] = {0xD0};
+    U8 rbacking1[1] = {0};
+    Fw::Buffer writeBuffer1(wdata1, sizeof(wdata1));
+    Fw::Buffer readBuffer1(rbacking1, sizeof(rbacking1));
+    ASSERT_EQ(this->invoke_to_SpiWriteRead(0, writeBuffer1, readBuffer1), Drv::SpiStatus::SPI_OK);
+    ASSERT_EQ(rbacking1[0], 0x11);
+
+    // Re-open the SAME component instance in DMA mode and inject a DMA
+    // timeout -- a driver that kept the old POLLED mode cached somewhere
+    // other than m_transferMode would ignore Stub_dmaCompletes and still
+    // report success here.
+    (void)this->component.open(SpiInstance::Spi5, Stm32::GpioPort::F, 6, 10, Stm32::TransferMode::DMA);
+    Stub_dmaCompletes = false;
+    U8 wdata2[1] = {0xD1};
+    U8 rbacking2[1] = {0};
+    Fw::Buffer writeBuffer2(wdata2, sizeof(wdata2));
+    Fw::Buffer readBuffer2(rbacking2, sizeof(rbacking2));
+    ASSERT_EQ(this->invoke_to_SpiWriteRead(0, writeBuffer2, readBuffer2), Drv::SpiStatus::SPI_WRITE_ERR);
 }
 
 void Stm32SpiDriverTester ::testSpiWriteReadBeforeOpen() {

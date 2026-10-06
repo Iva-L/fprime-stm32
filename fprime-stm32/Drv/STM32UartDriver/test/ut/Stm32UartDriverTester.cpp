@@ -25,6 +25,12 @@ extern U32 Stub_hwAbortTxCallCount;
 extern U32 Stub_hwAbortRxCallCount;
 extern U32 Stub_hwInvalidateRxStagingCallCount;
 extern U32 Stub_hwClearUartErrorCallCount;
+extern bool Stub_hwPolledTransmitSucceeds;
+extern U8 Stub_polledRxQueue[Stm32::Stm32UartDriverConfig::RX_STAGING_SIZE];
+extern FwSizeType Stub_polledRxQueueLen;
+extern FwSizeType Stub_polledRxQueuePos;
+extern U8 Stub_lastPolledTxData[Stm32::Stm32UartDriverConfig::TX_STAGING_SIZE];
+extern FwSizeType Stub_lastPolledTxLen;
 
 namespace Stm32 {
 
@@ -59,6 +65,16 @@ void Stm32UartDriverTester ::resetStubState() {
     Stub_hwAbortRxCallCount = 0;
     Stub_hwInvalidateRxStagingCallCount = 0;
     Stub_hwClearUartErrorCallCount = 0;
+    Stub_hwPolledTransmitSucceeds = true;
+    Stub_polledRxQueueLen = 0;
+    Stub_polledRxQueuePos = 0;
+    for (FwSizeType i = 0; i < sizeof(Stub_polledRxQueue); i++) {
+        Stub_polledRxQueue[i] = 0;
+    }
+    Stub_lastPolledTxLen = 0;
+    for (FwSizeType i = 0; i < sizeof(Stub_lastPolledTxData); i++) {
+        Stub_lastPolledTxData[i] = 0;
+    }
 
     this->m_allocateReturnsValid = false;
 }
@@ -89,6 +105,91 @@ void Stm32UartDriverTester ::testOpenFailure() {
     ASSERT_EVENTS_HalError(0, "ReceiveToIdle_DMA", 2);
     ASSERT_EVENTS_PortOpened_SIZE(0);
     ASSERT_from_ready_SIZE(0);
+}
+
+void Stm32UartDriverTester ::testOpenDefaultsToDma() {
+    (void)this->component.open(64, UsartInstance::Usart1, 0, 0, 115200);
+
+    // Proof of DMA-by-default: send() enqueues into the ring rather than
+    // transmitting synchronously (Stub_lastPolledTxLen stays 0, matching
+    // testSendPolledBypassesRing's inverse assertion), and poll() is what
+    // actually drives it to the HAL boundary's DMA capture.
+    U8 data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    Fw::Buffer buffer(data, sizeof(data));
+    ASSERT_EQ(this->invoke_to_send(0, buffer), Drv::ByteStreamStatus::OP_OK);
+    ASSERT_EQ(Stub_lastPolledTxLen, 0u);
+    ASSERT_EQ(Stub_lastTxLen, 0u);  // not yet drained
+
+    this->component.poll();
+    ASSERT_EQ(Stub_lastTxLen, 8u);
+}
+
+void Stm32UartDriverTester ::testOpenPolled() {
+    const Fw::Success status =
+        this->component.open(64, UsartInstance::Usart1, 0, 0, 115200, Stm32::TransferMode::POLLED);
+    ASSERT_EQ(status, Fw::Success::SUCCESS);
+}
+
+void Stm32UartDriverTester ::testSendPolledBypassesRing() {
+    (void)this->component.open(64, UsartInstance::Usart1, 0, 0, 115200, Stm32::TransferMode::POLLED);
+
+    U8 data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    Fw::Buffer buffer(data, sizeof(data));
+    const Drv::ByteStreamStatus status = this->invoke_to_send(0, buffer);
+    ASSERT_EQ(status, Drv::ByteStreamStatus::OP_OK);
+
+    // Transmitted synchronously via the blocking HAL boundary, not enqueued.
+    ASSERT_EQ(Stub_lastPolledTxLen, 8u);
+    for (FwSizeType i = 0; i < 8; i++) {
+        ASSERT_EQ(Stub_lastPolledTxData[i], data[i]);
+    }
+    ASSERT_EQ(Stub_lastTxLen, 0u);  // the DMA/ring staging path never ran
+
+    this->invoke_to_run(0, 0);
+    ASSERT_TLM_BytesSent(0, 8u);
+
+    // pollTx() has nothing queued to drain in POLLED mode.
+    this->component.poll();
+    ASSERT_EQ(Stub_lastTxLen, 0u);
+}
+
+void Stm32UartDriverTester ::testSendPolledTransmitFailure() {
+    (void)this->component.open(64, UsartInstance::Usart1, 0, 0, 115200, Stm32::TransferMode::POLLED);
+    Stub_hwPolledTransmitSucceeds = false;
+
+    U8 data[1] = {0x42};
+    Fw::Buffer buffer(data, sizeof(data));
+    const Drv::ByteStreamStatus status = this->invoke_to_send(0, buffer);
+    ASSERT_EQ(status, Drv::ByteStreamStatus::OTHER_ERROR);
+    ASSERT_EVENTS_HalError_SIZE(1);
+
+    this->invoke_to_run(0, 0);
+    ASSERT_TLM_TxErrorCount(0, 1u);
+    ASSERT_TLM_BytesSent(0, 0u);
+}
+
+void Stm32UartDriverTester ::testPollRxPolledDrainsBytes() {
+    (void)this->component.open(64, UsartInstance::Usart1, 0, 0, 115200, Stm32::TransferMode::POLLED);
+    this->m_allocateReturnsValid = true;
+
+    Stub_polledRxQueue[0] = 0xAA;
+    Stub_polledRxQueue[1] = 0xBB;
+    Stub_polledRxQueue[2] = 0xCC;
+    Stub_polledRxQueueLen = 3;
+
+    this->component.poll();
+
+    ASSERT_from_recv_SIZE(1);
+    const auto& recvEntry = this->fromPortHistory_recv->at(0);
+    ASSERT_EQ(recvEntry.buffer.getSize(), 3u);
+    ASSERT_EQ(recvEntry.status, Drv::ByteStreamStatus::OP_OK);
+    ASSERT_EQ(this->m_allocateBacking[0], 0xAA);
+    ASSERT_EQ(this->m_allocateBacking[1], 0xBB);
+    ASSERT_EQ(this->m_allocateBacking[2], 0xCC);
+
+    // The queue is drained; a second poll() finds nothing more to read.
+    this->component.poll();
+    ASSERT_from_recv_SIZE(1);
 }
 
 void Stm32UartDriverTester ::testSendInvalidBuffer() {
@@ -342,24 +443,29 @@ void Stm32UartDriverTester ::testUartErrorRecoveryDmaError() {
 }
 
 void Stm32UartDriverTester ::testTwoInstancesDoNotInterfere() {
-    (void)this->component.open(64, UsartInstance::Usart1, 0, 0, 115200);
+    (void)this->component.open(64, UsartInstance::Usart1, 0, 0, 115200, Stm32::TransferMode::DMA);
 
-    // A second, freestanding instance on a different USART. Before the
-    // multi-instance fix, the real HAL boundary's ISR callback trampoline
-    // cached a single {handle, component} pair shared by every
-    // Stm32UartDriver in the process -- opening this second instance would
-    // have silently rerouted the first instance's DMA-completion/RX/error
-    // callbacks to itself.
+    // A second, freestanding instance on a different USART, opened POLLED --
+    // m_transferMode must be per-instance state. Before the multi-instance
+    // fix, the real HAL boundary's ISR callback trampoline cached a single
+    // {handle, component} pair shared by every Stm32UartDriver in the
+    // process -- opening this second instance would have silently rerouted
+    // the first instance's DMA-completion/RX/error callbacks to itself.
     Stm32UartDriver secondComponent("Stm32UartDriverSecond");
-    const Fw::Success secondOpenStatus = secondComponent.open(64, UsartInstance::Usart2, 0, 0, 115200);
+    const Fw::Success secondOpenStatus =
+        secondComponent.open(64, UsartInstance::Usart2, 0, 0, 115200, Stm32::TransferMode::POLLED);
     ASSERT_EQ(secondOpenStatus, Fw::Success::SUCCESS);
 
-    // The first instance must still be fully functional, unaffected by the
-    // second instance's later open().
+    // The first instance must still be fully functional and still DMA,
+    // unaffected by the second instance's later (POLLED) open(): send()
+    // enqueues into the ring rather than transmitting synchronously.
     U8 data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     Fw::Buffer buffer(data, sizeof(data));
     const Drv::ByteStreamStatus status = this->invoke_to_send(0, buffer);
     ASSERT_EQ(status, Drv::ByteStreamStatus::OP_OK);
+    ASSERT_EQ(Stub_lastPolledTxLen, 0u);
+    this->component.poll();
+    ASSERT_EQ(Stub_lastTxLen, 8u);
 }
 
 Fw::Buffer Stm32UartDriverTester ::from_allocate_handler(FwIndexType portNum, FwSizeType size) {

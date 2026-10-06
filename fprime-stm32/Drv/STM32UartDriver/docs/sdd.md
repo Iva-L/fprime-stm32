@@ -2,7 +2,10 @@
 
 ## 1. Introduction
 
-`Stm32UartDriver` is a DMA-backed, non-blocking `Drv.ByteStreamDriver` for any STM32H7 USART/UART peripheral — which instance a given component instance owns is chosen at `open()` time via the `Stm32::UsartInstance` enum, not hardcoded to one board's wiring. On this reference deployment it is opened against **USART1** (PB14 TX / PB15 RX, routed to the STLINK-V3E virtual COM port on CN23), but the driver itself has no USART1-specific code path; see section 3.6 "Choosing a USART instance" for what a different board/project needs to add to use a different one. It implements the [`Drv.ByteStreamDriver`](../../../fprime/Drv/Interfaces/ByteStreamDriver.fpp) interface using DMA-backed, non-blocking transfers so the bare-metal cyclic executive never stalls waiting on serial I/O.
+`Stm32UartDriver` is a `Drv.ByteStreamDriver` for any STM32H7 USART/UART peripheral — which instance a given component instance owns is chosen at `open()` time via the `Stm32::UsartInstance` enum, not hardcoded to one board's wiring. On this reference deployment it is opened against **USART1** (PB14 TX / PB15 RX, routed to the STLINK-V3E virtual COM port on CN23), but the driver itself has no USART1-specific code path; see section 3.6 "Choosing a USART instance" for what a different board/project needs to add to use a different one. It implements the [`Drv.ByteStreamDriver`](../../../fprime/Drv/Interfaces/ByteStreamDriver.fpp) interface in one of two modes, selected per instance at `open()` time (see §3.8):
+
+- **DMA** (the default. This was the driver's only behavior before `TransferMode` existed, and the one real call site in this project, the USART1 comms link, relies on this default): ring-buffered, non-blocking idle-line DMA transfers, so the bare-metal cyclic executive never stalls waiting on serial I/O. The rest of this document (§3.1-3.7) describes this mode.
+- **POLLED**: `send` calls a single blocking `HAL_UART_Transmit()` and does not return until it completes or times out; `poll()` drains whatever bytes are already in the peripheral via a zero-timeout `HAL_UART_Receive()` peek each pass instead of idle-line DMA. An explicit, opt-in trade-off for a low-rate/debug UART instance where a blocking `send` is acceptable -- see §3.8.
 
 Unlike [`Drv::LinuxUartDriver`](../../../fprime/Drv/LinuxUartDriver/docs/sdd.md), which this component started from, there is no receive thread: the bare-metal execution model forbids RTOS threads, so every DMA start/completion decision, error recovery step, and `Fw::Buffer` ownership transfer happens from a single polled state machine (`run_handler`), called directly from the cyclic executive every loop pass (see `Main.cpp`) rather than through a rate group, since a 1 Hz/0.5 Hz/0.25 Hz cadence would be far too slow for a byte-stream driver.
 
@@ -11,8 +14,8 @@ Unlike [`Drv::LinuxUartDriver`](../../../fprime/Drv/LinuxUartDriver/docs/sdd.md)
 | Name | Description | Validation |
 |---|---|---|
 | STM32-UART-COMP-001 | Shall implement the `Drv.ByteStreamDriver` interface | inspection |
-| STM32-UART-COMP-002 | Shall never block the cyclic executive on USART1 TX or RX | inspection |
-| STM32-UART-COMP-003 | Shall use DMA for both TX and RX, with idle-line detection on RX | inspection |
+| STM32-UART-COMP-002 | A DMA-mode instance shall never block the cyclic executive on TX or RX. A POLLED-mode instance explicitly trades this away: `send` blocks until its `HAL_UART_Transmit()` completes or times out | inspection |
+| STM32-UART-COMP-003 | A DMA-mode instance shall use DMA for both TX and RX, with idle-line detection on RX; a POLLED-mode instance shall use direct blocking/zero-timeout HAL calls, with no DMA stream, cache maintenance, or ISR callback registration | inspection, test |
 | STM32-UART-COMP-004 | Shall keep all DMA-visible buffers in AXI SRAM, not DTCM | inspection |
 | STM32-UART-COMP-005 | Shall perform D-cache clean/invalidate around every DMA transfer | inspection |
 | STM32-UART-COMP-006 | Shall recover from UART/DMA errors and transaction timeouts without hanging | test |
@@ -62,14 +65,33 @@ All of the instance-specific mapping lives in `Stm32UartDriver.cpp` (the real HA
 
 The real HAL callbacks are plain C free functions with no user-context pointer -- only the raw `UART_HandleTypeDef*` the interrupt fired on -- so they can't use `this->m_instance` the way the rest of the HAL boundary does. `hwOpen()` registers `{halHandle, this}` into a small fixed-size table (`s_uartRegistry`, sized to `UsartInstance`'s own cardinality, indexed by the instance itself), and each callback does a short linear scan of that table (negligible ISR cost at 8 entries) to find which live `Stm32UartDriver` owns the handle it was given, then forwards to that instance. This is the same registry-table pattern `Stm32::STM32Timer` uses for its own single ISR callback (see its `docs/sdd.md` §2). Because the table is indexed by instance rather than a single shared pointer, opening a second driver instance against a *different* USART/UART peripheral never disturbs the first instance's callback routing -- the scenario this replaced a genuine bug in (a single `s_instance`/`s_huart` pair, silently overwritten by a second `open()` with no assert or link error to flag the mistake).
 
+### 3.8 Choosing a transfer mode
+
+`open()`'s final parameter is a `Stm32::TransferMode`, defaulting to `DMA` so every existing call site keeps its current, non-blocking behavior unchanged. `m_transferMode` is stored as a plain component member (not file-static state), so a `Stm32UartDriver` on USART1 can stay DMA-backed while a second instance on, say, a debug USART is opened POLLED -- each instance's `send_handler()`/`pollTx()`/`pollRx()` branch on its own `m_transferMode` independently.
+
+**DMA** instances behave exactly as described in §3.2-3.7: `hwOpen()` runs `MX_DMA_Init()`, enables the instance's NVIC interrupt, registers it in `s_uartRegistry`, and arms the first `HAL_UARTEx_ReceiveToIdle_DMA()`.
+
+**POLLED** instances skip all of that -- `hwOpen()` only runs `MX_USARTn_UART_Init()` and returns; no DMA stream, no NVIC enable, no registry entry, so a POLLED instance's HAL callbacks (if any ever fired, which they won't without a DMA/IRQ setup) would simply find nothing registered. Instead:
+
+- `send_handler()` bypasses `m_txRing`/`m_txStaging` entirely and calls `hwPolledTransmit()`, a single blocking `HAL_UART_Transmit()` bounded by the same on-wire-time watchdog formula (`TX_BITS_PER_BYTE`/`TX_TIMEOUT_MARGIN`/`TX_TIMEOUT_SLACK_US`, `UartDriverConfig.hpp`) DMA mode uses for its background watchdog -- here applied as the blocking call's actual timeout, since there is no `poll()` step left to recover a stuck transfer.
+- `pollTx()` is a no-op: there is never anything queued to drain.
+- `pollRx()` calls `hwPolledReceiveByte()` -- a zero-timeout `HAL_UART_Receive()` of one byte -- in a loop bounded by `RX_STAGING_SIZE` per `poll()` pass, stopping the moment no byte is available. Each byte lands in the same `m_rxRing` DMA mode uses, so the downstream drain-to-`recv_out()` logic is identical in both modes; only how bytes *enter* the ring differs.
+
+Because `hwPolledReceiveByte()`'s timeout is 0 (an immediate peek, not a wait), `poll()` never blocks waiting for RX data in either mode -- the "never block the cyclic executive" property (STM32-UART-COMP-002) holds for RX in POLLED mode too. Only `send` blocks in POLLED mode, and only because a caller explicitly opted into it.
+
 ## 4. Usage
 
 ```cpp
-// configureTopology(), after commsBufferManager sizing is known:
+// configureTopology(), after commsBufferManager sizing is known. DMA is the
+// default -- unchanged from before TransferMode existed.
 const Fw::Success comDriverOpened = comDriver.open(FW_COM_BUFFER_MAX_SIZE, Stm32::UsartInstance::Usart1, USART_IRQ_PREEMPT_PRIORITY, USART_IRQ_SUB_PRIORITY, BAUD_RATE);
     if(comDriverOpened == Fw::Success::FAILURE) {
         Fw::Logger::log("[ERROR] Failed to open UART\n");
     }
+
+// A second, low-rate debug UART instance opted into POLLED explicitly:
+const Fw::Success debugUartOpened = debugUartDriver.open(64, Stm32::UsartInstance::Usart2, 0, 0, 115200,
+                                                           Stm32::TransferMode::POLLED);
 
 // Main.cpp cyclic executive loop, every pass:
 static_cast<Stm32::Stm32UartDriverComponentBase&>(ReferenceDeployment::comDriver).run_handlerBase(0, 0);

@@ -47,6 +47,30 @@ class Stm32SpiDriverTester final : public Stm32SpiDriverGTestBase {
     //! boundary's init fails (injected via Stub_hwOpenSucceeds)
     void testOpenFailure();
 
+    //! open() without an explicit mode argument defaults to POLLED (backward compatibility)
+    void testOpenDefaultsToPolled();
+
+    //! open() forwards an explicit DMA mode request to the HAL boundary
+    void testOpenDma();
+
+    //! SpiWriteRead() in DMA mode performs the same logical transfer as
+    //! POLLED (CS bracketing, exact tx/rx bytes) once the completion
+    //! callback fires
+    void testSpiWriteReadDmaSuccess();
+
+    //! SpiWriteRead() in DMA mode propagates a HAL boundary failure status
+    //! reported after DMA "completion" and emits HalError
+    void testSpiWriteReadDmaFailure();
+
+    //! SpiWriteRead() in DMA mode times out and reports SPI_WRITE_ERR when
+    //! the completion callback never fires (injected via Stub_dmaCompletes)
+    void testSpiWriteReadDmaTimeout();
+
+    //! Re-opening the same component instance with a different mode switches
+    //! its transfer behavior -- proves TransferMode is per-open() instance
+    //! state, not shared/global
+    void testReopenSwitchesMode();
+
     //! SpiWriteRead()/SpiReadWrite() before open() report/return SPI_OPEN_ERR
     void testSpiWriteReadBeforeOpen();
     void testSpiReadWriteBeforeOpen();

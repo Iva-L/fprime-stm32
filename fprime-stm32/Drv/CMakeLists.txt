@@ -55,3 +55,18 @@ check_cxx_source_compiles("
 if(HARDWARE_I2C_ENABLED)
     add_fprime_subdirectory("${CMAKE_CURRENT_LIST_DIR}/STM32I2cDriver")
 endif()
+
+# ==========================================
+# SPI Driver Check
+# ==========================================
+check_cxx_source_compiles("
+    #include \"Stm32Config.hpp\"
+    #if !defined(SPI_ENABLED) || (SPI_ENABLED == 0)
+    #error \"SPI is disabled\"
+    #endif
+    int main() { return 0; }
+" HARDWARE_SPI_ENABLED)
+
+if(HARDWARE_SPI_ENABLED)
+    add_fprime_subdirectory("${CMAKE_CURRENT_LIST_DIR}/STM32SpiDriver")
+endif()

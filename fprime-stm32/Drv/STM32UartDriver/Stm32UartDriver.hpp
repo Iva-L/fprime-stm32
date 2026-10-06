@@ -11,6 +11,7 @@
 #include <Fw/Types/SuccessEnumAc.hpp>
 #include <Os/RawTime.hpp>
 #include <config/UartDriverConfig.hpp>
+#include <config/Stm32TransferMode.hpp>
 
 namespace Stm32 {
 
@@ -33,8 +34,19 @@ class Stm32UartDriver final : public Stm32UartDriverComponentBase {
     //! \param preemptPriority NVIC preempt priority for the instance's global interrupt
     //! \param subPriority NVIC subpriority for the instance's global interrupt
     //! \param baudRate desired baud rate for the peripheral
+    //! \param mode DMA (default, backward-compatible -- this driver has no
+    //!        other behavior today) keeps the existing ring-buffered,
+    //!        non-blocking idle-line DMA design, where `send` enqueues and
+    //!        returns immediately and `poll()` drains/arms DMA in the
+    //!        background. POLLED bypasses the ring/DMA entirely: `send`
+    //!        calls a single blocking HAL_UART_Transmit() and returns only
+    //!        once it completes (or times out), and `poll()` drains
+    //!        whatever bytes are already in the peripheral via a
+    //!        zero-timeout HAL_UART_Receive() peek each pass instead of
+    //!        idle-line DMA -- an explicit, opt-in trade-off for low-rate/
+    //!        debug UARTs where blocking `send` is acceptable.
     Fw::Success open(FwSizeType allocationSize, UsartInstance instance, U32 preemptPriority, U32 subPriority,
-                      U32 baudRate);
+                      U32 baudRate, TransferMode mode = TransferMode::DMA);
     
     //! One bounded step of the DMA state machine: consume ISR-latched
     //! completion/error state, run cache maintenance, start the next transfer,
@@ -70,13 +82,15 @@ class Stm32UartDriver final : public Stm32UartDriverComponentBase {
     // unit tests).
     // ----------------------------------------------------------------------
 
-    //! Run MX_DMA_Init()/MX_USARTn_UART_Init() for the selected instance,
-    //! configure that instance's global NVIC interrupt (IRQn derived from
-    //! `instance`), and arm the first RX reception. Returns true on success
-    //! (matches today's HAL_OK checks) and reports the peripheral's actual
+    //! Run MX_USARTn_UART_Init() for the selected instance. When `mode` is
+    //! DMA: also run MX_DMA_Init(), configure that instance's global NVIC
+    //! interrupt (IRQn derived from `instance`), register this instance for
+    //! ISR callback routing, and arm the first RX reception -- none of
+    //! which a POLLED instance needs. Returns true on success (matches
+    //! today's HAL_OK checks) and reports the peripheral's actual
     //! configured baud via outActualBaudRate; emits HalError itself on
     //! failure since only this method knows which HAL call failed.
-    bool hwOpen(UsartInstance instance, U32 preemptPriority, U32 subPriority, U32 requestedBaudRate,
+    bool hwOpen(UsartInstance instance, U32 preemptPriority, U32 subPriority, U32 requestedBaudRate, TransferMode mode,
                 U32& outActualBaudRate);
 
     //! Clean the D-cache over [data, data + len) and start a TX DMA
@@ -106,6 +120,17 @@ class Stm32UartDriver final : public Stm32UartDriverComponentBase {
     //! exposing the bitmask itself outside the HAL boundary.
     void hwClassifyUartError(U32 errorCode, bool& isRxAffecting, bool& isDmaAffecting);
 
+    //! POLLED mode only: a single blocking HAL_UART_Transmit() of `len`
+    //! bytes, bounded by `timeoutMs`. Returns true iff it completed
+    //! successfully; no ring buffer, no DMA, no cache maintenance.
+    bool hwPolledTransmit(const U8* data, FwSizeType len, U32 timeoutMs);
+
+    //! POLLED mode only: a zero-timeout HAL_UART_Receive() of a single
+    //! byte -- returns true and sets `outByte` iff a byte was already
+    //! available in the peripheral, false immediately otherwise. Never
+    //! blocks, so repeated calls from poll() are safe.
+    bool hwPolledReceiveByte(U8& outByte);
+
     // ----------------------------------------------------------------------
     // Handler implementations for user-defined typed input ports
     // ----------------------------------------------------------------------
@@ -127,6 +152,7 @@ class Stm32UartDriver final : public Stm32UartDriverComponentBase {
     //! small fixed-size registry indexed by this same enum, since the HAL
     //! callbacks themselves receive no instance/context, only a raw handle.
     UsartInstance m_instance;
+    TransferMode m_transferMode;
 
     //! RX ring buffer and associated state.
     U8 m_rxRing[RX_RING_SIZE];

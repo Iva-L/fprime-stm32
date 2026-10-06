@@ -9,7 +9,10 @@
 
 #include <fprime-stm32/Drv/STM32I2cDriver/Stm32I2cDriver.hpp>
 #include <Fw/Types/Assert.hpp>
+#include <Os/RawTime.hpp>
 
+#include "CacheMaintenance.hpp"
+#include "dma.h"
 #include "i2c.h"
 
 namespace {
@@ -103,11 +106,64 @@ uint32_t toTiming(Stm32::I2cBusSpeed busSpeed) {
 
 }  // namespace
 
+namespace {
+
+constexpr FwSizeType I2C_INSTANCE_CAPACITY = 4;  // I2cInstance::I2c1..I2c4
+
+struct I2cRegistryEntry {
+    I2C_HandleTypeDef* handle = nullptr;
+    Stm32::Stm32I2cDriver* component = nullptr;
+};
+
+I2cRegistryEntry s_i2cRegistry[I2C_INSTANCE_CAPACITY];
+
+//! Look up which live Stm32I2cDriver instance (if any) owns `hi2c`, by
+//! linear scan of the small (<=4-entry) registry.
+Stm32::Stm32I2cDriver* findI2cComponent(I2C_HandleTypeDef* hi2c) {
+    for (FwSizeType i = 0; i < I2C_INSTANCE_CAPACITY; i++) {
+        if (s_i2cRegistry[i].handle == hi2c && s_i2cRegistry[i].component != nullptr) {
+            return s_i2cRegistry[i].component;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+extern "C" void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef* hi2c) {
+    FW_ASSERT(hi2c != nullptr);
+    Stm32::Stm32I2cDriver* const component = findI2cComponent(hi2c);
+    if (component != nullptr) {
+        component->signalDmaComplete();
+    }
+}
+
+extern "C" void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef* hi2c) {
+    FW_ASSERT(hi2c != nullptr);
+    Stm32::Stm32I2cDriver* const component = findI2cComponent(hi2c);
+    if (component != nullptr) {
+        component->signalDmaComplete();
+    }
+}
+
+extern "C" void HAL_I2C_ErrorCallback(I2C_HandleTypeDef* hi2c) {
+    FW_ASSERT(hi2c != nullptr);
+    Stm32::Stm32I2cDriver* const component = findI2cComponent(hi2c);
+    if (component != nullptr) {
+        component->signalDmaError(hi2c->ErrorCode);
+    }
+}
+
 namespace Stm32 {
 
-Fw::Success Stm32I2cDriver ::open(I2cInstance instance, I2cBusSpeed busSpeed) {
+Fw::Success Stm32I2cDriver ::open(I2cInstance instance, I2cBusSpeed busSpeed, TransferMode mode) {
     I2C_HandleTypeDef* const halHandle = toHalHandle(instance);
     FW_ASSERT(halHandle != nullptr, static_cast<FwAssertArgType>(instance));
+
+    // DMA1 clock/NVIC must be enabled before HAL_I2C_MspInit() links a DMA stream to this instance.
+    if (mode == TransferMode::DMA) {
+        MX_DMA_Init();
+    }
 
     // MX_I2Cn_Init() traps in Error_Handler() on failure rather than
     // returning a status (matches every other CubeMX-generated
@@ -123,7 +179,16 @@ Fw::Success Stm32I2cDriver ::open(I2cInstance instance, I2cBusSpeed busSpeed) {
     }
 
     this->m_instance = instance;
+    this->m_transferMode = mode;
     this->m_opened = true;
+
+    if (mode == TransferMode::DMA) {
+        FW_ASSERT(halHandle->hdmatx != nullptr, static_cast<FwAssertArgType>(instance));
+        FW_ASSERT(halHandle->hdmarx != nullptr, static_cast<FwAssertArgType>(instance));
+
+        FW_ASSERT(static_cast<FwSizeType>(instance) < I2C_INSTANCE_CAPACITY, static_cast<FwAssertArgType>(instance));
+        s_i2cRegistry[static_cast<FwSizeType>(instance)] = {halHandle, this};
+    }
 
     Fw::LogStringArg _speedArg(busSpeed == Stm32::I2cBusSpeed::Standard ? "Standard" :
                                busSpeed == Stm32::I2cBusSpeed::Fast ? "Fast" :
@@ -132,6 +197,28 @@ Fw::Success Stm32I2cDriver ::open(I2cInstance instance, I2cBusSpeed busSpeed) {
     this->log_ACTIVITY_HI_PortOpened(_speedArg);
     return Fw::Success::SUCCESS;
 }
+
+namespace {
+
+//! Block the calling thread until signalDmaComplete()/signalDmaError() clears `dmaBusy`, or `timeoutMs` elapses.
+bool waitForI2cDma(volatile bool& dmaBusy, U32 timeoutMs) {
+    Os::RawTime dmaStart;
+    (void)dmaStart.now();
+    const U32 timeoutUs = timeoutMs * 1000U;
+    constexpr U32 MAX_DMA_POLL_ITERATIONS = 1000000U;  // hard backstop; the time check below is the real bound
+    for (U32 i = 0; dmaBusy && (i < MAX_DMA_POLL_ITERATIONS); i++) {
+        Os::RawTime now;
+        (void)now.now();
+        U32 elapsedUs = 0;
+        (void)now.getDiffUsec(dmaStart, elapsedUs);
+        if (elapsedUs >= timeoutUs) {
+            break;
+        }
+    }
+    return !dmaBusy;
+}
+
+}  // namespace
 
 //! Address-phase NACK (no device answered) is reported via HAL_I2C_GetError(),
 //! not the HAL_StatusTypeDef -- distinguishes I2C_ADDRESS_ERR from a
@@ -145,8 +232,37 @@ Drv::I2cStatus Stm32I2cDriver ::hwMasterTransmit(U16 devAddress, U8* data, U16 l
     I2C_HandleTypeDef* const halHandle = toHalHandle(this->m_instance);
     FW_ASSERT(halHandle != nullptr);
 
-    const HAL_StatusTypeDef status =
-        HAL_I2C_Master_Transmit(halHandle, static_cast<uint16_t>(devAddress << 1U), data, len, TRANSACTION_TIMEOUT_MS);
+    HAL_StatusTypeDef status;
+    if (this->m_transferMode == TransferMode::POLLED) {
+        status = HAL_I2C_Master_Transmit(halHandle, static_cast<uint16_t>(devAddress << 1U), data, len,
+                                          TRANSACTION_TIMEOUT_MS);
+    } else {
+        Stm32::AssertDmaSafe(data, len);
+        Stm32::CleanDCacheForDma(data, len);
+        this->m_dmaBusy = true;
+        this->m_dmaErrorCode = 0;
+        status = HAL_I2C_Master_Transmit_DMA(halHandle, static_cast<uint16_t>(devAddress << 1U), data, len);
+        if (status == HAL_OK) {
+
+            this->unLock();
+            const bool completed = waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS);
+            if (!completed) {
+                (void)HAL_I2C_Master_Abort_IT(halHandle, static_cast<uint16_t>(devAddress << 1U));
+                // The abort itself completes via the same interrupts.
+                (void)waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS);
+            }
+            this->lock();
+            if (!completed) {
+                this->m_dmaBusy = false;
+                status = HAL_TIMEOUT;
+            } else {
+                status = (this->m_dmaErrorCode == 0) ? HAL_OK : HAL_ERROR;
+            }
+        } else {
+            this->m_dmaBusy = false;
+        }
+    }
+
     if (status == HAL_OK) {
         return Drv::I2cStatus::I2C_OK;
     }
@@ -162,8 +278,38 @@ Drv::I2cStatus Stm32I2cDriver ::hwMasterReceive(U16 devAddress, U8* data, U16 le
     I2C_HandleTypeDef* const halHandle = toHalHandle(this->m_instance);
     FW_ASSERT(halHandle != nullptr);
 
-    const HAL_StatusTypeDef status =
-        HAL_I2C_Master_Receive(halHandle, static_cast<uint16_t>(devAddress << 1U), data, len, TRANSACTION_TIMEOUT_MS);
+    HAL_StatusTypeDef status;
+    if (this->m_transferMode == TransferMode::POLLED) {
+        status = HAL_I2C_Master_Receive(halHandle, static_cast<uint16_t>(devAddress << 1U), data, len,
+                                         TRANSACTION_TIMEOUT_MS);
+    } else {
+        Stm32::AssertDmaSafe(data, len);
+        this->m_dmaBusy = true;
+        this->m_dmaErrorCode = 0;
+        status = HAL_I2C_Master_Receive_DMA(halHandle, static_cast<uint16_t>(devAddress << 1U), data, len);
+        if (status == HAL_OK) {
+            // See the identical comment in hwMasterTransmit(): this
+            // guarded port's lock() disables every maskable interrupt, so
+            // the completion ISR can never run unless we unlock first.
+            this->unLock();
+            const bool completed = waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS);
+            if (!completed) {
+                (void)HAL_I2C_Master_Abort_IT(halHandle, static_cast<uint16_t>(devAddress << 1U));
+                (void)waitForI2cDma(this->m_dmaBusy, TRANSACTION_TIMEOUT_MS);
+            }
+            this->lock();
+            if (!completed) {
+                this->m_dmaBusy = false;
+                status = HAL_TIMEOUT;
+            } else {
+                status = (this->m_dmaErrorCode == 0) ? HAL_OK : HAL_ERROR;
+                Stm32::InvalidateDCacheForDma(data, len);
+            }
+        } else {
+            this->m_dmaBusy = false;
+        }
+    }
+
     if (status == HAL_OK) {
         return Drv::I2cStatus::I2C_OK;
     }

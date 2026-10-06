@@ -47,9 +47,11 @@ used by the direct bare-metal GPIO examples.
 - `Allocator`: fixed-pool bootstrap allocator + newlib `--wrap` traps
   enforcing the no-heap-after-bootstrap rule -- fully hardware-agnostic, so
   every project gets it without hand-rolling one
-- `Core/CortexM7`: ARM-core-level helpers (currently just D-cache
-  maintenance), grouped by core rather than by ST family since they only
-  depend on which Cortex-M core is in use
+- `Core/CortexM7`: ARM-core-level helpers (D-cache maintenance and the
+  DMA-safe-buffer assertion), grouped by core rather than by ST family since
+  they only depend on which Cortex-M core is in use. The next family added
+  (e.g. STM32F4, Cortex-M4) needs its own `Core/CortexM4` with the same
+  function names and no-op bodies -- see "Adding a new chip family" below.
 
 This library is hardware-agnostic: it contains no CubeMX-generated code and
 no board-specific source. It only expects a CMake target named `FprimeStm32`
@@ -123,6 +125,113 @@ new family: create `Os/Stm32<Family>/` alongside it with the same four
 an `elseif (FPRIME_PLATFORM STREQUAL "stm32<family>")` branch in
 `Os/CMakeLists.txt`. The `Drv/STM32*/CMakeLists.txt` real/stub selection
 already matches any `stm32*` platform, so no change is needed there.
+
+#### Checklist: adding a new family (e.g. STM32F4)
+
+STM32F4 is the next planned family. It's a useful worst-case example because
+it differs from STM32H7 in exactly the place this library's DMA support
+leans on hardest: **Cortex-M4 has no data cache at all** (not just "cache
+disabled" -- `SCB_CleanDCache_by_Addr`/`SCB_InvalidateDCache_by_Addr` don't
+exist in the M4 CMSIS core header, so calling them is a compile error, not a
+logical no-op), and F4's memory map has no `DTCM`/`AXI_SRAM` split -- just
+plain SRAM uniformly reachable by DMA. Every item below either doesn't apply
+to F4 for that reason, or exists specifically to stay correct across a family
+that has no cache and no DMA-excluded RAM region.
+
+**1. Toolchain & CMake platform**
+- [ ] Add `cmake/toolchain/stm32f4.cmake` with the family's own compiler flags
+      (`-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard`, vs. H7's
+      `-mcpu=cortex-m7 -mfpu=fpv5-d16`) and chip define (e.g.
+      `-DSTM32F407xx` in place of `-DSTM32H753xx`).
+- [ ] Add `cmake/platform/stm32f4.cmake` mirroring `stm32h7.cmake`'s module
+      wiring.
+- [ ] Add an `elseif (FPRIME_PLATFORM STREQUAL "stm32f4")` branch in
+      `Os/CMakeLists.txt` (see above) -- the `Drv/STM32*/CMakeLists.txt`
+      `FPRIME_PLATFORM MATCHES "^stm32"` conditionals already match
+      `stm32f4` with no changes needed.
+
+**2. Vendor HAL / CMSIS / linker** (project-owned, like today's
+`Hardware/stm32h753_hal/`, but required for the library to compile against)
+- [ ] Vendor `STM32F4xx_HAL_Driver` + CMSIS `Device/ST/STM32F4xx`, generated
+      from a CubeMX `.ioc` for the chosen F4 part, under the consuming
+      project's `Hardware/` tree.
+- [ ] Verify the vendored HAL version actually exposes
+      `HAL_UARTEx_ReceiveToIdle_DMA`/`HAL_UARTEx_RxEventCallback` if
+      DMA-mode UART is wanted on F4 -- this API landed in the HAL at a
+      specific version per family; don't assume parity with the H7 package.
+- [ ] Write a new linker script for the F4 part's actual flash/RAM layout.
+      There is no `AXI_SRAM`/`DTCM_RAM` split on F4 (just `SRAM1`/`SRAM2`/...),
+      so this README's "Memory and placement" table needs an F4-specific
+      variant, not a reused one.
+- [ ] Give `PlatformMemory.hpp`'s `ATTR_DTCM_BSS` macro an F4 definition that
+      compiles to nothing (plain `.bss` placement) -- F4 has no DTCM bus for
+      it to point at.
+
+**3. Core-level abstraction (cache + DMA-safety) -- the part this family
+actually changes**
+- [ ] Create `Core/CortexM4/CacheMaintenance.hpp` alongside
+      `Core/CortexM7/CacheMaintenance.hpp`, exporting the *same* three
+      function names (`CleanDCacheForDma`, `InvalidateDCacheForDma`,
+      `AssertDmaSafe`) in the same `Stm32` namespace, so no driver `.cpp`
+      ever needs an `#ifdef` -- only the CMake include path changes:
+  - `CleanDCacheForDma`/`InvalidateDCacheForDma` become empty inline
+    no-ops. Do not `#include` or otherwise reuse the M7 version -- the
+    `SCB_*DCache_by_Addr` calls it wraps don't exist on M4.
+  - `AssertDmaSafe` becomes a no-op that always passes -- there's no
+    DTCM-vs-SRAM split on F4, so there's no "unsafe for DMA" address range
+    to assert against.
+- [ ] Add a sibling `FprimeStm32CoreCortexM4` interface CMake target
+      (mirroring `FprimeStm32CoreCortexM7`'s single
+      `target_include_directories` line) pointing at `Core/CortexM4`.
+- [ ] In every `Drv/STM32*Driver/CMakeLists.txt`'s real-target `DEPENDS`,
+      select the core target *by family*, not by the generic `^stm32` match
+      used for everything else (e.g. `stm32h7` depends on
+      `FprimeStm32CoreCortexM7`, `stm32f4` on `FprimeStm32CoreCortexM4`).
+
+**4. OS abstraction layer**
+- [ ] Create `Os/Stm32F4/` per the four-call pattern above.
+- [ ] Check whether `Os::RawTime`/`Os::Mutex`'s actual implementations are
+      Cortex-M-generic (DWT cycle counter, `PRIMASK`) rather than
+      H7-specific before copying them -- if they're already core-generic,
+      factor the shared logic into an `Os/CortexM/` implementation both
+      `Stm32H7` and `Stm32F4` depend on instead of duplicating it.
+
+**5. Driver instance wiring** (`toHalHandle()`/`callInstanceInit()`/`hw*()`
+in each driver's real `.cpp`)
+- [ ] Confirm the HAL struct/function names (`SPI_HandleTypeDef`,
+      `HAL_SPI_TransmitReceive`, `HAL_SPI_TransmitReceive_DMA`, ...) are
+      identical between the F4 and H7 HAL packages -- they are, by ST's
+      design, so these methods need **no changes** once the matching
+      CubeMX-generated `spi.c`/`i2c.c`/`usart.c` externs exist for the F4
+      project.
+- [ ] Check each driver's instance-enable macros in `Stm32Config.hpp`
+      against the chosen F4 part's actual peripheral count (fewer
+      SPI/I2C/USART instances than H753 is common) -- leave the ones that
+      don't exist `false` forever; the enum itself doesn't need to shrink.
+- [ ] Verify the F4 HAL's `__HAL_LINKDMA()` convention populates
+      `hdmatx`/`hdmarx` the same way H7's does -- if so, the
+      `hdmatx != nullptr`/`hdmarx != nullptr` safety assert in
+      `Stm32SpiDriver`/`Stm32I2cDriver::open()` works unmodified.
+
+**6. Documentation**
+- [ ] Revisit each driver's `docs/sdd.md` for claims that were implicitly
+      H7-specific (e.g. "D-cache maintenance," AXI SRAM wording) now that a
+      second family's DMA path exists.
+- [ ] Add an F4 entry to this README's "Supported hardware" section once a
+      concrete evaluation board is targeted.
+
+**7. Verification**
+- [ ] `fprime-util build stm32f4` from a project with the F4 `Hardware/`
+      tree wired -- confirms the cross-compile, the new `Core/CortexM4`
+      headers, and the new OS backend all link.
+- [ ] Host-native `fprime-util check` needs **no changes** for a new
+      family: `<Driver>Stub.cpp` has zero HAL/CMSIS dependency already, so
+      the UT suite is family-agnostic by construction.
+- [ ] Smoke-test at least one DMA-mode and one POLLED-mode instance on real
+      F4 hardware before trusting the no-op cache functions silently -- on a
+      cache-less core, a successful build already proves more than it would
+      on H7 (there's no `SCB_*DCache_by_Addr` call left to have gotten
+      wrong), but the DMA data path itself still needs a real hardware pass.
 
 ## Integration and build
 

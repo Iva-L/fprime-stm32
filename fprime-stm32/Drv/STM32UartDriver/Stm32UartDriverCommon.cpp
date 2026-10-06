@@ -20,6 +20,7 @@ namespace Stm32 {
 Stm32UartDriver ::Stm32UartDriver(const char* const compName)
     : Stm32UartDriverComponentBase(compName),
       m_instance(UsartInstance::Usart1),
+      m_transferMode(TransferMode::DMA),
       m_txHead(0),
       m_txCount(0),
       m_txTimeoutUs(0),
@@ -54,15 +55,16 @@ void Stm32UartDriver ::signalUartError(U32 errorCode) {
 }
 
 Fw::Success Stm32UartDriver ::open(FwSizeType allocationSize, UsartInstance instance, U32 preemptPriority,
-                                    U32 subPriority, U32 baudRate) {
+                                    U32 subPriority, U32 baudRate, TransferMode mode) {
     this->m_instance = instance;
+    this->m_transferMode = mode;
     this->m_allocationSize = allocationSize;
 
     this->m_baudRate = baudRate;
     FW_ASSERT(this->m_baudRate > 0);
 
     U32 actualBaudRate = 0;
-    if (!this->hwOpen(instance, preemptPriority, subPriority, baudRate, actualBaudRate)) {
+    if (!this->hwOpen(instance, preemptPriority, subPriority, baudRate, mode, actualBaudRate)) {
         return Fw::Success::FAILURE;
     }
 
@@ -99,6 +101,23 @@ Drv::ByteStreamStatus Stm32UartDriver ::send_handler(FwIndexType portNum, Fw::Bu
     }
 
     const FwSizeType size = serBuffer.getSize();
+
+    if (this->m_transferMode == TransferMode::POLLED) {
+        // Bypasses the ring/DMA entirely: a single blocking HAL_UART_Transmit(),
+        // bounded by the same on-wire-time-based watchdog pollTx() uses for its
+        // DMA timeout, so send() does not return until the bytes are actually
+        // on the wire (or that watchdog expires).
+        const U32 onWireUs =
+            static_cast<U32>((static_cast<U64>(size) * TX_BITS_PER_BYTE * 1000000U) / this->m_baudRate);
+        const U32 timeoutMs = ((onWireUs * TX_TIMEOUT_MARGIN) + TX_TIMEOUT_SLACK_US) / 1000U + 1U;
+        if (!this->hwPolledTransmit(serBuffer.getData(), size, timeoutMs)) {
+            this->m_txErrorCount++;
+            return Drv::ByteStreamStatus::OTHER_ERROR;
+        }
+        this->m_bytesSent += size;
+        return Drv::ByteStreamStatus::OP_OK;
+    }
+
     const FwSizeType free = TX_RING_SIZE - this->m_txCount;
     if (size > free) {
         this->log_WARNING_HI_TxRingFull(static_cast<U32>(size), static_cast<U32>(free));
@@ -124,6 +143,10 @@ void Stm32UartDriver ::recvReturnIn_handler(FwIndexType portNum, Fw::Buffer& fwB
 // ----------------------------------------------------------------------
 
 void Stm32UartDriver ::pollTx() {
+    if (this->m_transferMode == TransferMode::POLLED) {
+        return;  // send_handler() already transmitted synchronously; nothing queued to drain.
+    }
+
     if (this->m_txDmaBusy) {
         Os::RawTime now;
         (void)now.now();
@@ -168,29 +191,51 @@ void Stm32UartDriver ::pollTx() {
 // ----------------------------------------------------------------------
 
 void Stm32UartDriver ::pollRx() {
-    if (this->m_rxChunkReady) {
-        const FwSizeType len = this->m_rxChunkLen;
-        this->m_rxChunkReady = false;
-        this->m_rxChunkLen = 0;
+    if (this->m_transferMode == TransferMode::DMA) {
+        if (this->m_rxChunkReady) {
+            const FwSizeType len = this->m_rxChunkLen;
+            this->m_rxChunkReady = false;
+            this->m_rxChunkLen = 0;
 
-        this->hwInvalidateRxStaging();
+            this->hwInvalidateRxStaging();
 
+            const FwSizeType freeSpace = RX_RING_SIZE - this->m_rxCount;
+            const FwSizeType toCopy = (len < freeSpace) ? len : freeSpace;
+            for (FwSizeType i = 0; i < toCopy; i++) {
+                this->m_rxRing[(this->m_rxHead + i) % RX_RING_SIZE] = this->m_rxStaging[i];
+            }
+            this->m_rxHead = (this->m_rxHead + toCopy) % RX_RING_SIZE;
+            this->m_rxCount += toCopy;
+
+            if (toCopy < len) {
+                this->m_rxErrorCount++;
+                this->log_WARNING_HI_RxRingFull(static_cast<U32>(len - toCopy));
+            }
+
+            // Re-arm immediately so no bytes are lost while the ring/Fw::Buffer
+            // drain below runs.
+            (void)this->hwRestartRx();
+        }
+    } else {
+        // POLLED mode: no idle-line DMA armed, so pull whatever bytes are
+        // already sitting in the peripheral ourselves, one zero-timeout
+        // HAL_UART_Receive() peek at a time. Bounded by RX_STAGING_SIZE per
+        // poll() call -- the same per-pass cap DMA mode's idle-line chunk
+        // is implicitly bounded by -- so a byte-starved call can't spin
+        // forever, and stops the moment no byte is available.
         const FwSizeType freeSpace = RX_RING_SIZE - this->m_rxCount;
-        const FwSizeType toCopy = (len < freeSpace) ? len : freeSpace;
-        for (FwSizeType i = 0; i < toCopy; i++) {
-            this->m_rxRing[(this->m_rxHead + i) % RX_RING_SIZE] = this->m_rxStaging[i];
+        const FwSizeType maxBytes = (RX_STAGING_SIZE < freeSpace) ? RX_STAGING_SIZE : freeSpace;
+        FwSizeType received = 0;
+        for (FwSizeType i = 0; i < maxBytes; i++) {
+            U8 byte = 0;
+            if (!this->hwPolledReceiveByte(byte)) {
+                break;
+            }
+            this->m_rxRing[(this->m_rxHead + received) % RX_RING_SIZE] = byte;
+            received++;
         }
-        this->m_rxHead = (this->m_rxHead + toCopy) % RX_RING_SIZE;
-        this->m_rxCount += toCopy;
-
-        if (toCopy < len) {
-            this->m_rxErrorCount++;
-            this->log_WARNING_HI_RxRingFull(static_cast<U32>(len - toCopy));
-        }
-
-        // Re-arm immediately so no bytes are lost while the ring/Fw::Buffer
-        // drain below runs.
-        (void)this->hwRestartRx();
+        this->m_rxHead = (this->m_rxHead + received) % RX_RING_SIZE;
+        this->m_rxCount += received;
     }
 
     if (this->m_rxCount == 0) {

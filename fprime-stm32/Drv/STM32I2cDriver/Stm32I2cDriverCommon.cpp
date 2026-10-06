@@ -19,9 +19,24 @@ namespace Stm32 {
 // ----------------------------------------------------------------------
 
 Stm32I2cDriver ::Stm32I2cDriver(const char* const compName)
-    : Stm32I2cDriverComponentBase(compName), m_instance(I2cInstance::I2c1), m_opened(false) {}
+    : Stm32I2cDriverComponentBase(compName),
+      m_instance(I2cInstance::I2c1),
+      m_transferMode(TransferMode::POLLED),
+      m_opened(false),
+      m_dmaBusy(false),
+      m_dmaErrorCode(0) {}
 
 Stm32I2cDriver ::~Stm32I2cDriver() {}
+
+void Stm32I2cDriver ::signalDmaComplete() {
+    this->m_dmaErrorCode = 0;
+    this->m_dmaBusy = false;
+}
+
+void Stm32I2cDriver ::signalDmaError(U32 errorCode) {
+    this->m_dmaErrorCode = errorCode;
+    this->m_dmaBusy = false;
+}
 
 // ----------------------------------------------------------------------
 // Handler implementations for user-defined typed input ports
