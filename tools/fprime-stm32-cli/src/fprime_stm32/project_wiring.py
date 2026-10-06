@@ -184,4 +184,15 @@ def patch_top_cmakelists(text: str) -> tuple[str, list[str]]:
         if ok:
             actions.append("Added FprimeStm32Allocator to Top/CMakeLists.txt's DEPENDS")
 
+    if not re.search(r"\bfprime-baremetal-config\b", patched):
+        module_match = _REGISTER_MODULE_RE.search(patched)
+        if module_match is None:
+            raise CliError(
+                "Could not find a register_fprime_module(...) call in this deployment's "
+                "Top/CMakeLists.txt - unrecognized template"
+            )
+        patched, ok = _patch_call_list(patched, _DEPENDS_LIST_RE, "\n        fprime-baremetal-config")
+        if ok:
+            actions.append("Added fprime-baremetal-config to Top/CMakeLists.txt's DEPENDS")
+
     return patched, actions
