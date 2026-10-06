@@ -33,8 +33,8 @@ constexpr std::uintptr_t DTCM_RAM_SIZE = 0x20000U;  // 128 KiB
 //! violation is a build/configuration bug, not a runtime input to guard
 //! against gracefully.
 inline void AssertDmaSafe(const void* addr, std::size_t size) {
-    const auto start = reinterpret_cast<std::uintptr_t>(addr);
     FW_ASSERT(addr != nullptr);
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
     const auto end = start + size;
     const bool overlapsDtcm = (start < DTCM_RAM_BASE + DTCM_RAM_SIZE) && (end > DTCM_RAM_BASE);
     FW_ASSERT(!overlapsDtcm, static_cast<FwAssertArgType>(start));
