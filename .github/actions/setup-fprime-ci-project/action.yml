@@ -1,0 +1,58 @@
+name: 'Set up throwaway F´ CI project'
+description: >
+  This repo is an F´ library (library.cmake + source), not a deployment: it
+  ships no settings.ini and no top-level CMakeLists.txt of its own, so
+  fprime-util has no project to operate on. Checks out the F´ framework and
+  writes a throwaway settings.ini/CMakeLists.txt/Stm32Config.hpp override
+  (never committed) around the already-checked-out library so fprime-util
+  commands in later steps have a project to find.
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout F' framework
+      uses: actions/checkout@v4
+      with:
+        repository: nasa/fprime
+        # Pinned to the exact commit this library's CMakeLists.txt files
+        # (e.g. STM32GpioDriver/STM32Timer's intentionally-empty
+        # host-platform DEPENDS) are actually verified against. Bump this
+        # deliberately, not accidentally -- a newer fprime can add stricter
+        # CMake checks (e.g. rejecting an empty DEPENDS list outright) that
+        # break this build even though nothing in this library changed.
+        ref: 8a42c8b5309acf1a61bb71d6fac62872f26e9990
+        path: fprime
+        submodules: recursive # fprime vendors googletest as its own submodule
+
+    - name: Write throwaway CI project
+      shell: bash
+      run: |
+        cat > settings.ini << 'EOF'
+        [fprime]
+        project_root: .
+        framework_path: ./fprime
+        EOF
+        cat > CMakeLists.txt << 'EOF'
+        cmake_minimum_required(VERSION 3.24.2)
+        project(FprimeStm32CI C CXX)
+        include("${CMAKE_CURRENT_LIST_DIR}/fprime/cmake/FPrime.cmake")
+        fprime_setup_included_code()
+        include("${CMAKE_CURRENT_LIST_DIR}/library.cmake")
+        EOF
+        # fprime-stm32/Drv/CMakeLists.txt gates I2C/SPI registration on a
+        # check_cxx_source_compiles() test against a *hardcoded* path --
+        # not the generic settings.ini config_directory mechanism. Without
+        # recreating that exact path here, it silently falls back to the
+        # library's own default Stm32Config.hpp, where I2C_ENABLED/
+        # SPI_ENABLED are both false, and those drivers' UT targets never
+        # get registered at all -- no error, they just don't exist to run.
+        mkdir -p FprimeStm32BaremetalReference/config/fprime-stm32
+        cat > FprimeStm32BaremetalReference/config/fprime-stm32/Stm32Config.hpp << 'EOF'
+        #ifndef STM32_CONFIG_HPP
+        #define STM32_CONFIG_HPP
+        #define USART_ENABLED (true)
+        #define TIM_ENABLED (true)
+        #define I2C_ENABLED (true)
+        #define SPI_ENABLED (true)
+        #endif
+        EOF
